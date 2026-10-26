@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>取货门店助手 · 本地测试</title>
+<style>
+  body { font: 13px/1.6 -apple-system, "PingFang SC", sans-serif; margin: 16px; }
+  pre { background: #f5f5f7; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+  iframe { width: 420px; height: 90px; border: 1px solid #ddd; margin: 4px 0; }
+</style>
+</head>
+<body>
+<h3>取货门店助手 · 本地测试（不联网，不访问 Apple）</h3>
+<pre id="summary">running…</pre>
+<div id="frames"></div>
+
+<script>
+/*
+ * 每个场景开一个 iframe 载入 mock_pickup_page.html，等 content.js 汇报结果，然后断言。
+ * 断言内容：选中了哪家门店、点击了哪些元素、fragment 是否被清掉。
+ */
+var BASE = "mock_pickup_page.html";
+
+var SCENARIOS = [
+  { name: "1 单门店 R484",
+    q: "stores=R484:ok", frag: "R484",
+    expect: { status: "selected", store: "R484" } },
+
+  { name: "2 多门店 R761→R793→R484 全可选，选最高优先",
+    q: "stores=R484:ok,R793:ok,R761:ok", frag: "R761,R793,R484",
+    expect: { status: "selected", store: "R761" } },
+
+  { name: "3 最高优先门店不在列表里，自动选第二家",
+    q: "stores=R793:ok,R484:ok", frag: "R761,R793,R484",
+    expect: { status: "selected", store: "R793" } },
+
+  { name: "4 最高优先门店 disabled，自动选第二家",
+    q: "stores=R761:off,R793:ok,R484:ok", frag: "R761,R793,R484",
+    expect: { status: "selected", store: "R793" } },
+
+  { name: "5 最高优先门店 aria-disabled，自动选第二家",
+    q: "stores=R761:aria,R793:ok", frag: "R761,R793",
+    expect: { status: "selected", store: "R793" } },
+
+  { name: "6 前两家都不可用，选第三家 R484",
+    q: "stores=R761:off,R793:aria,R484:ok", frag: "R761,R793,R484",
+    expect: { status: "selected", store: "R484" } },
+
+  { name: "7 候选全都不在列表里 → 安全退出，零点击",
+    q: "stores=R577:ok,R639:ok", frag: "R761,R793,R484",
+    expect: { status: "failed", reason: "no_selectable_candidate", clicks: 0 } },
+
+  { name: "8 候选全部 disabled → 安全退出，零点击",
+    q: "stores=R761:off,R793:off", frag: "R761,R793",
+    expect: { status: "failed", reason: "no_selectable_candidate", clicks: 0 } },
+
+  { name: "9 门店列表一直不出现 → 超时退出，零点击",
+    q: "", frag: "R484", timeout: 700,
+    expect: { status: "failed", reason: "panel_timeout", clicks: 0 } },
+
+  { name: "10 没有 fragment（auto_select_store=false）→ 完全不动作",
+    q: "stores=R484:ok", frag: null,
+    expect: { status: "inactive", clicks: 0, hash: "" } },
+
+  { name: "11 候选已经是选中状态 → 认可结果且不重复点击",
+    q: "stores=R761:checked,R793:ok", frag: "R761,R793",
+    expect: { status: "selected", store: "R761", clicks: 0 } },
+
+  { name: "12 fragment 里的其它键保留，只清掉 duomonitor-stores",
+    q: "stores=R484:ok", frag: "R484", rawFrag: "a=b&duomonitor-stores=R484",
+    expect: { status: "selected", store: "R484", hash: "#a=b" } },
+
+  { name: "13 非法 token 被丢弃，只认合法门店号",
+    q: "stores=R793:ok,R484:ok", frag: null,
+    rawFrag: "duomonitor-stores=" + encodeURIComponent("<script>,DROP TABLE,,R484,token=abc,R484,R793"),
+    expect: { status: "selected", store: "R484", candidates: ["R484", "R793"] } }
+];
+
+var results = [];
+var pending = {};
+
+window.addEventListener("message", function (e) {
+  var d = e.data;
+  if (!d || d.type !== "duomonitor-test") { return; }
+  if (pending[d.name]) { pending[d.name](d); delete pending[d.name]; }
+});
+
+function runOne(sc, idx) {
+  return new Promise(function (resolve) {
+    var name = "s" + idx;
+    var frag = sc.rawFrag ? ("#" + sc.rawFrag) : (sc.frag ? "#duomonitor-stores=" + sc.frag : "");
+    // 生产用的是 15000ms；这里压到 2500ms 只为让测试跑得快，仍远大于渲染门店列表所需时间
+    var url = BASE + "?name=" + name + "&timeout=" + (sc.timeout || 2500) + "&settle=300&poll=40&delay=120" +
+      (sc.q ? "&" + sc.q : "") + frag;
+    var done = false;
+    pending[name] = function (msg) { done = true; resolve(check(sc, msg)); };
+    var f = document.createElement("iframe");
+    f.src = url;
+    document.getElementById("frames").appendChild(f);
+    setTimeout(function () {
+      if (!done) { delete pending[name]; resolve({ name: sc.name, ok: false, why: "超时未收到结果（content.js 没有结束）" }); }
+    }, 5000);
+  });
+}
+
+function check(sc, msg) {
+  var e = sc.expect;
+  var o = msg.outcome || {};
+  var why = [];
+  if (o.status !== e.status) { why.push("status=" + o.status + " 期望 " + e.status); }
+  if (e.store && o.store !== e.store) { why.push("store=" + o.store + " 期望 " + e.store); }
+  if (e.reason && o.reason !== e.reason) { why.push("reason=" + o.reason + " 期望 " + e.reason); }
+  if (typeof e.clicks === "number" && msg.clicks.length !== e.clicks) {
+    why.push("点击 " + msg.clicks.length + " 次 期望 " + e.clicks + " 次: " + msg.clicks.join("|"));
+  }
+  if (typeof e.hash === "string" && msg.hash !== e.hash) { why.push("hash=" + JSON.stringify(msg.hash) + " 期望 " + JSON.stringify(e.hash)); }
+  if (e.candidates && String(o.candidates) !== String(e.candidates)) {
+    why.push("candidates=" + String(o.candidates) + " 期望 " + String(e.candidates));
+  }
+  // 全场景硬性红线：绝不能点到“继续”或“加入购物袋”
+  msg.clicks.forEach(function (c) {
+    if (c.indexOf("#continue") >= 0 || c.indexOf("#atb") >= 0) { why.push("点到了禁止元素 " + c); }
+  });
+  // 除了 inactive 场景，fragment 必须已经被清掉
+  if (o.status !== "inactive" && msg.hash.indexOf("duomonitor-stores") >= 0) {
+    why.push("fragment 没被清除: " + msg.hash);
+  }
+  // 成功场景必须恰好点 1 次（或 0 次，如果本来就是选中的），且点的是门店 radio
+  if (o.status === "selected" && msg.clicks.length > 1) { why.push("成功场景点击超过 1 次: " + msg.clicks.join("|")); }
+  if (o.status === "selected" && msg.clicks.length === 1 && msg.clicks[0].indexOf("[name=store-") < 0) {
+    why.push("点的不是门店 radio: " + msg.clicks[0]);
+  }
+  return { name: sc.name, ok: why.length === 0, why: why.join("; "), clicks: msg.clicks.join("|") || "(无)" };
+}
+
+// 预热：先空跑一次，把 content.js / mock 页面加载进缓存，避免第一个场景受冷启动影响
+function warmup() {
+  return new Promise(function (resolve) {
+    pending["warm"] = function () { resolve(); };
+    var f = document.createElement("iframe");
+    f.src = BASE + "?name=warm&timeout=2500&settle=300&poll=40&delay=60&stores=R484:ok#duomonitor-stores=R484";
+    document.getElementById("frames").appendChild(f);
+    setTimeout(function () { delete pending["warm"]; resolve(); }, 4000);
+  });
+}
+
+(async function () {
+  await warmup();
+  for (var i = 0; i < SCENARIOS.length; i++) {
+    results.push(await runOne(SCENARIOS[i], i));
+  }
+  var pass = results.filter(function (r) { return r.ok; }).length;
+  var lines = results.map(function (r) {
+    return (r.ok ? "PASS  " : "FAIL  ") + r.name + (r.ok ? "  [点击: " + r.clicks + "]" : "  → " + r.why);
+  });
+  lines.push("");
+  lines.push("总计 " + pass + "/" + results.length + " 通过");
+  document.getElementById("summary").textContent = lines.join("\n");
+  document.title = (pass === results.length ? "ALL PASS " : "FAILED ") + pass + "/" + results.length;
+})();
+</script>
+</body>
+</html>

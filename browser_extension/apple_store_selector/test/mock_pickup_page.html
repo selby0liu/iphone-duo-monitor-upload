@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mock pickup panel</title>
+<style>
+  body { font: 13px -apple-system, sans-serif; margin: 8px; }
+  label { display: inline-block; margin-right: 12px; }
+</style>
+</head>
+<body>
+<!-- 假的 Apple 购买页取货面板：只用来测 content.js，不联网、不碰 Apple -->
+<button id="continue" type="button" data-autom="continuePickUp">继续</button>
+<button id="atb" type="button" data-autom="add-to-cart">加入购物袋</button>
+<div id="trigger-slot"></div>
+<div id="panel"></div>
+
+<script>
+// 1) 点击探针：记录页面上被点击的每一个元素（捕获阶段），用来证明只点了允许的元素
+(function () {
+  var q = new URLSearchParams(location.search);
+  var clicks = [];
+  document.addEventListener("click", function (e) {
+    var t = e.target || {};
+    clicks.push((t.tagName || "?") + (t.id ? "#" + t.id : "") +
+      (t.name ? "[name=" + t.name + "]" : "") + (t.value ? "[value=" + t.value + "]" : ""));
+  }, true);
+  window.__clicks = clicks;
+
+  // 2) 测试注入点（线上的隔离世界里页面写不进这个对象，只有本地测试直接加载 content.js 时才生效）
+  window.__DUOMONITOR_TEST__ = {
+    panelTimeoutMs: +(q.get("timeout") || 900),
+    settleMs: +(q.get("settle") || 300),
+    pollMs: +(q.get("poll") || 40),
+    triggerRetryMs: +(q.get("retry") || 150),
+    triggerInitialDelayMs: +(q.get("initdelay") || 250),
+    autoOpenPanel: q.get("autoopen") !== "0",
+    onDone: function (outcome) {
+      parent.postMessage({
+        type: "duomonitor-test",
+        name: q.get("name") || "",
+        outcome: outcome,
+        clicks: clicks.slice(),
+        hash: location.hash,
+        path: location.pathname + location.search,
+        src: q.get("src") || "/apple_store_selector/"
+      }, "*");
+    }
+  };
+
+  // 核心 + 启动器从哪个目录加载：默认是权威源，对比测试时指向 Safari 扩展包里的副本。
+  // 用 document.write 保证和 manifest 里一样的同步加载顺序。
+  var src = q.get("src") || "/apple_store_selector/";
+  document.write('<scr' + 'ipt src="' + src + 'store_selector_core.js"><\/scr' + 'ipt>');
+  document.write('<scr' + 'ipt src="' + src + 'content.js"><\/scr' + 'ipt>');
+})();
+</script>
+
+<script>
+// 3) 渲染“查看供货情况”触发器和门店列表
+(function () {
+  var NAMES = {
+    R761: "深圳万象城", R793: "深圳前海壹方城", R484: "深圳益田假日广场",
+    R577: "广州天环广场", R639: "广州珠江新城"
+  };
+  var q = new URLSearchParams(location.search);
+  var spec = q.get("stores") || "";
+  var delay = +(q.get("delay") || 120);
+  // trigger: none=没有触发器 | ok=button[type=button] | submit=button 默认 submit（危险，必须被拒绝）
+  //          link=a href="#" | navlink=a href="/shop/bag"（会跳走，必须被拒绝） | badtext=文字是“继续”
+  var triggerKind = q.get("trigger") || "none";
+  // gate: open=门店列表直接渲染 | trigger=必须点过触发器才渲染
+  var gate = q.get("gate") || "open";
+  var part = "MG704CH/A";
+
+  function renderStores() {
+    if (!spec) { return; }
+    var panel = document.getElementById("panel");
+    if (panel.childElementCount) { return; }
+    spec.split(",").forEach(function (item, idx) {
+      var bits = item.split(":");
+      var sn = bits[0];
+      var mode = bits[1] || "ok";
+      var id = "store-radio-" + idx;
+      var input = document.createElement("input");
+      input.type = "radio";
+      input.name = "store-" + part;
+      input.value = sn;
+      input.id = id;
+      if (mode === "off") { input.disabled = true; }
+      if (mode === "aria") { input.setAttribute("aria-disabled", "true"); }
+      if (mode === "checked") { input.checked = true; }
+      var label = document.createElement("label");
+      label.setAttribute("for", id);
+      label.textContent = NAMES[sn] || sn;
+      panel.appendChild(input);
+      panel.appendChild(label);
+    });
+  }
+
+  function makeTrigger() {
+    var el;
+    if (triggerKind === "ok") {
+      el = document.createElement("button");
+      el.type = "button";
+      el.className = "rf-pickup-quote-overlay-trigger";
+      el.textContent = "查看供货情况";
+    } else if (triggerKind === "submit") {
+      el = document.createElement("button");           // 不写 type → 默认 submit
+      el.className = "rf-pickup-quote-overlay-trigger";
+      el.textContent = "查看供货情况";
+    } else if (triggerKind === "link") {
+      el = document.createElement("a");
+      el.setAttribute("href", "#");
+      el.textContent = "查看供货情况";
+    } else if (triggerKind === "navlink") {
+      el = document.createElement("a");
+      el.setAttribute("href", "/shop/bag");
+      el.className = "rf-pickup-quote-overlay-trigger";
+      el.textContent = "查看供货情况";
+    } else if (triggerKind === "badtext") {
+      el = document.createElement("button");
+      el.type = "button";
+      el.className = "rf-pickup-quote-overlay-trigger";
+      el.textContent = "继续";                          // 红线词，必须被拒绝
+    } else {
+      return null;
+    }
+    el.id = "pickup-trigger";
+    el.setAttribute("aria-expanded", "false");
+    el.addEventListener("click", function (e) {
+      if (triggerKind === "submit") { e.preventDefault(); }
+      el.setAttribute("aria-expanded", "true");
+      var dlg = document.createElement("div");
+      dlg.setAttribute("role", "dialog");
+      dlg.id = "overlay";
+      document.getElementById("trigger-slot").appendChild(dlg);
+      setTimeout(renderStores, delay);
+    });
+    return el;
+  }
+
+  var t = makeTrigger();
+  if (t) { document.getElementById("trigger-slot").appendChild(t); }
+  if (gate === "open") { setTimeout(renderStores, delay); }
+
+  // 核心没加载成功（例如 Safari 扩展包还没构建）时立刻报错，而不是让上层干等到超时
+  if (!window.DuoMonitorStoreSelector) {
+    parent.postMessage({
+      type: "duomonitor-test", name: q.get("name") || "",
+      outcome: { status: "core_missing" }, clicks: [], hash: location.hash,
+      path: location.pathname, src: q.get("src") || "/apple_store_selector/"
+    }, "*");
+  }
+})();
+</script>
+</body>
+</html>

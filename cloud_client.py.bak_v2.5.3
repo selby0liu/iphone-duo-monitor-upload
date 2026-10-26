@@ -1,0 +1,315 @@
+"""
+Cloud Client - 从云端服务器读取监控状态
+
+供 Mac App 在 Cloud 模式下使用。
+- 只读
+- Token 认证
+- 断线不显示无货，显示"数据暂不可更新"
+"""
+
+import json
+import time
+import logging
+import requests
+from threading import Thread, Lock
+
+logger = logging.getLogger(__name__)
+
+
+class CloudClient:
+    """云端状态客户端"""
+
+    def __init__(self, server_url: str = "", auth_token: str = "", poll_interval: int = 10):
+        """
+        Args:
+            server_url: 云端服务器地址，如 http://49.235.136.61:8765
+            auth_token: 认证 Token
+            poll_interval: 轮询间隔（秒）
+        """
+        self.server_url = server_url.rstrip("/")
+        self.auth_token = auth_token
+        self.poll_interval = poll_interval
+
+        self._thread = None
+        self._running = False
+        self._lock = Lock()
+        self._last_status = None
+        self._last_update = 0
+        self._last_error = ""
+        self._online = False
+
+        # 状态回调
+        self.status_callback = None
+
+    def start(self):
+        """启动后台轮询线程"""
+        if self._running:
+            return
+        if not self.server_url or not self.auth_token:
+            logger.warning("Cloud Client: server_url 或 auth_token 未配置，不启动")
+            return
+
+        self._running = True
+        self._thread = Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"Cloud Client 已启动: {self.server_url}，间隔 {self.poll_interval}s")
+
+    def stop(self):
+        """停止轮询"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        logger.info("Cloud Client 已停止")
+
+    def _poll_loop(self):
+        """后台轮询循环"""
+        while self._running:
+            try:
+                status = self._fetch_status()
+                with self._lock:
+                    self._last_status = status
+                    self._last_update = time.time()
+                    self._online = True
+                    self._last_error = ""
+
+                if self.status_callback:
+                    self.status_callback(status, True, "")
+
+            except Exception as e:
+                with self._lock:
+                    self._online = False
+                    self._last_error = str(e)
+
+                if self.status_callback:
+                    self.status_callback(self._last_status, False, str(e))
+
+                logger.warning(f"Cloud Client 请求失败: {e}")
+
+            # 等待下一次轮询
+            for _ in range(self.poll_interval * 10):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+    def _fetch_status(self) -> dict:
+        """从云端获取状态"""
+        url = f"{self.server_url}/status"
+        headers = {"Authorization": f"Bearer {self.auth_token}"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_status(self) -> dict | None:
+        """获取最近一次状态"""
+        with self._lock:
+            return self._last_status
+
+    def is_online(self) -> bool:
+        """云端是否在线"""
+        with self._lock:
+            return self._online
+
+    def get_last_update(self) -> float:
+        """获取最后更新时间戳"""
+        with self._lock:
+            return self._last_update
+
+    def get_last_error(self) -> str:
+        """获取最后错误信息"""
+        with self._lock:
+            return self._last_error
+
+    def test_connection(self) -> tuple[bool, str]:
+        """测试连接（同步）"""
+        try:
+            status = self._fetch_status()
+            return True, f"连接成功，服务运行 {status.get('monitor', {}).get('uptime_seconds', 0):.0f}s"
+        except Exception as e:
+            return False, str(e)
+
+
+SOURCE_LABELS = ["主", "备", "备2", "备3"]
+
+
+def merge_cloud_statuses(sources: list) -> tuple:
+    """
+    合并多台服务器的 /status。
+    sources: [(label, url, status_or_None, error_str), ...]，顺序=优先级
+    返回 (merged_status_or_None, online: bool, error: str)
+
+    规则：
+    - 顶部统计/趋势取"活跃源"（Pickup 正常且 last_check 最新的在线源）
+    - inventory 逐键合并：已知值(True/False)优先于 UNKNOWN(None)，同为已知取 last_checked 最新的
+    - pickup.api_available = 任一在线源正常（"是否有人在替你盯着"）
+    - 附加 cloud_sources / cloud_active_label 供 GUI 显示
+    """
+    online = [(label, url, s) for label, url, s, _ in sources if isinstance(s, dict)]
+    if not online:
+        errors = "; ".join(f"{label}:{err}" for label, _, _, err in sources if err)
+        return None, False, errors or "所有 Cloud 源均离线"
+
+    def health(item):
+        s = item[2]
+        return (1 if s.get("pickup", {}).get("api_available") else 0,
+                s.get("monitor", {}).get("last_check") or 0)
+
+    active_label, active_url, active = max(online, key=health)
+    merged = dict(active)
+
+    inv = {}
+    for _, _, s in online:
+        for key, entry in (s.get("inventory") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            cur = inv.get(key)
+            if cur is None:
+                inv[key] = entry
+                continue
+            e_known = entry.get("available") is not None
+            c_known = cur.get("available") is not None
+            e_ts = entry.get("last_checked") or 0
+            c_ts = cur.get("last_checked") or 0
+            if (e_known and not c_known) or (e_known == c_known and e_ts > c_ts):
+                inv[key] = entry
+    merged["inventory"] = inv
+
+    pickup = dict(active.get("pickup", {}))
+    healthy = [label for label, _, s in online if s.get("pickup", {}).get("api_available")]
+    pickup["api_available"] = bool(healthy)
+    merged["pickup"] = pickup
+
+    merged["cloud_sources"] = [
+        {
+            "label": label,
+            "url": url,
+            "online": isinstance(s, dict),
+            "api_available": bool(s.get("pickup", {}).get("api_available")) if isinstance(s, dict) else None,
+            "last_check": s.get("monitor", {}).get("last_check") if isinstance(s, dict) else None,
+            "error": err or "",
+            "active": isinstance(s, dict) and label == active_label,
+        }
+        for label, url, s, err in sources
+    ]
+    merged["cloud_active_label"] = "+".join(healthy) if healthy else f"{active_label}(异常)"
+    return merged, True, ""
+
+
+class MultiCloudClient:
+    """
+    多源云端状态客户端：同时轮询主/备服务器，合并后回调。
+    接口与 CloudClient 兼容（start/stop/status_callback/get_status/is_online/get_last_update/get_last_error）。
+    """
+
+    def __init__(self, server_urls: list, auth_token: str = "", poll_interval: int = 10, fetcher=None):
+        self.server_urls = [u.strip().rstrip("/") for u in (server_urls or []) if u and u.strip()]
+        self.auth_token = auth_token
+        self.poll_interval = poll_interval
+        self._fetcher = fetcher  # 测试注入: fetcher(url, token) -> dict
+
+        self._thread = None
+        self._running = False
+        self._lock = Lock()
+        self._last_status = None
+        self._last_update = 0
+        self._last_error = ""
+        self._online = False
+        self.status_callback = None
+
+    @property
+    def labels(self) -> list:
+        return [SOURCE_LABELS[i] if i < len(SOURCE_LABELS) else f"源{i + 1}" for i in range(len(self.server_urls))]
+
+    def _fetch_one(self, url: str) -> dict:
+        if self._fetcher is not None:
+            return self._fetcher(url, self.auth_token)
+        resp = requests.get(f"{url}/status", headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def poll_once(self) -> tuple:
+        """并行拉取所有源并合并，返回 (merged_or_None, online, error)；不抛异常。"""
+        results = [None] * len(self.server_urls)
+
+        def worker(i, url):
+            try:
+                results[i] = (self.labels[i], url, self._fetch_one(url), "")
+            except Exception as e:
+                results[i] = (self.labels[i], url, None, str(e))
+
+        threads = [Thread(target=worker, args=(i, u), daemon=True) for i, u in enumerate(self.server_urls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        for i, r in enumerate(results):
+            if r is None:
+                results[i] = (self.labels[i], self.server_urls[i], None, "timeout")
+        return merge_cloud_statuses(results)
+
+    def start(self):
+        if self._running:
+            return
+        if not self.server_urls or not self.auth_token:
+            logger.warning("MultiCloudClient: server_urls 或 auth_token 未配置，不启动")
+            return
+        self._running = True
+        self._thread = Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"MultiCloudClient 已启动: {self.server_urls}，间隔 {self.poll_interval}s")
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        logger.info("MultiCloudClient 已停止")
+
+    def _poll_loop(self):
+        while self._running:
+            merged, online, error = self.poll_once()
+            with self._lock:
+                if online:
+                    self._last_status = merged
+                    self._last_update = time.time()
+                self._online = online
+                self._last_error = error
+            if self.status_callback:
+                try:
+                    self.status_callback(merged if online else self._last_status, online, error)
+                except Exception as e:
+                    logger.warning(f"MultiCloudClient 回调异常: {e}")
+            if not online:
+                logger.warning(f"MultiCloudClient 所有源离线: {error}")
+            for _ in range(self.poll_interval * 10):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+    def get_status(self) -> dict | None:
+        with self._lock:
+            return self._last_status
+
+    def is_online(self) -> bool:
+        with self._lock:
+            return self._online
+
+    def get_last_update(self) -> float:
+        with self._lock:
+            return self._last_update
+
+    def get_last_error(self) -> str:
+        with self._lock:
+            return self._last_error
+
+    def test_connection(self) -> tuple[bool, str]:
+        merged, online, error = self.poll_once()
+        if not online:
+            return False, error
+        parts = []
+        for src in merged.get("cloud_sources", []):
+            if src["online"]:
+                parts.append(f"{src['label']}: 在线, Pickup {'正常' if src['api_available'] else '异常'}")
+            else:
+                parts.append(f"{src['label']}: 离线 ({src['error'][:40]})")
+        return True, " | ".join(parts)

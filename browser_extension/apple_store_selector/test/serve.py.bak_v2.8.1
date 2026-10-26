@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+扩展测试用的本地静态服务器（只监听 127.0.0.1，不访问 Apple，不访问任何外部网络）。
+
+除了把 browser_extension/apple_store_selector/ 发出来，还提供两条假路由，用来证明两件事：
+  1. URL fragment 永远不会随 HTTP 请求发到服务器（/__requests 里看不到 duomonitor-stores）
+  2. fragment 能穿过 302 重定向（Apple 的 /shop/product/<SKU> → /shop/buy-iphone/... 就是 302）
+
+用法：python3 browser_extension/apple_store_selector/test/serve.py --port 8799
+然后浏览器打开 http://127.0.0.1:8799/test/run_tests.html
+"""
+
+import os
+import sys
+import json
+import argparse
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+EXT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REQUESTS = []
+
+REDIRECT_TARGET = "/shop/buy-iphone/iphone-17/mock"
+TARGET_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>mock buy page</title></head><body>
+<p id="href"></p><p id="hash"></p>
+<script>
+document.getElementById("href").textContent = "href=" + location.href;
+document.getElementById("hash").textContent = "hash=" + location.hash;
+document.title = "hash:" + (location.hash || "(empty)");
+</script></body></html>"""
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=EXT_ROOT, **kw)
+
+    def _record(self):
+        REQUESTS.append(self.requestline)
+
+    def do_GET(self):
+        self._record()
+        if self.path.startswith("/shop/product/"):
+            self.send_response(302)
+            self.send_header("Location", REDIRECT_TARGET)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path.split("?")[0] == REDIRECT_TARGET:
+            body = TARGET_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.split("?")[0] == "/__requests":
+            body = json.dumps(REQUESTS, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+    def log_message(self, fmt, *a):
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8799)
+    args = p.parse_args()
+    if args.host != "127.0.0.1":
+        print("拒绝监听非 127.0.0.1 地址：此脚本只用于本机测试", file=sys.stderr)
+        sys.exit(2)
+    print(f"扩展测试服务器: http://{args.host}:{args.port}/test/run_tests.html")
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

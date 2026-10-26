@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "iPhone Duo Monitor 取货门店助手",
+  "version": "1.2.0",
+  "description": "本地助手：在 Apple 中国购买页自动点开“查看供货情况”，等门店列表加载出来后按本机候选顺序选中仍可取货的最高优先门店，然后停下。不点“继续”、不加入购物袋、不结账、不付款。",
+  "content_scripts": [
+    {
+      "matches": ["https://www.apple.com.cn/shop/*"],
+      "js": ["store_selector_core.js", "content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}

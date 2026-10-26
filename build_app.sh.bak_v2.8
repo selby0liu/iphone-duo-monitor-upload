@@ -1,0 +1,59 @@
+#!/bin/bash
+# iPhone Duo 库存监控 - macOS .app 打包脚本
+# 使用 PyInstaller 打包为 Apple Silicon 原生应用
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "=========================================="
+echo "iPhone Duo 库存监控 - 打包为 macOS .app"
+echo "=========================================="
+
+# 检查 PyInstaller
+if ! command -v pyinstaller &> /dev/null; then
+    echo "安装 PyInstaller..."
+    pip3 install pyinstaller
+fi
+
+# 清理旧的构建
+rm -rf build dist
+rm -f iphone_duo_monitor.spec
+
+echo ""
+echo "开始打包..."
+echo ""
+
+pyinstaller \
+    --name "iPhoneDuoMonitor" \
+    --windowed \
+    --onefile \
+    --clean \
+    --noconfirm \
+    --add-data "config.json:." \
+    --add-data "skus.json:." \
+    --add-data "stores.json:." \
+    --add-data "LICENSE:." \
+    --add-data "ATTRIBUTION.md:." \
+    --hidden-import "PySide6.QtWidgets" \
+    --hidden-import "PySide6.QtCore" \
+    --hidden-import "PySide6.QtGui" \
+    --collect-submodules "PySide6" \
+    gui_app.py
+
+echo ""
+echo "=========================================="
+echo "打包完成！"
+echo "应用位置: dist/iPhoneDuoMonitor.app"
+echo "=========================================="
+
+# 显示应用信息
+if [ -d "dist/iPhoneDuoMonitor.app" ]; then
+    echo ""
+    echo "应用信息:"
+    ls -lh dist/iPhoneDuoMonitor.app/Contents/MacOS/
+    echo ""
+    echo "架构:"
+    file dist/iPhoneDuoMonitor.app/Contents/MacOS/iPhoneDuoMonitor
+fi

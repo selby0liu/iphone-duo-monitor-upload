@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+主/备服务器卡片与指示灯的离屏 GUI 测试（需要 PySide6；不联网，不启动监控）
+
+运行：QT_QPA_PLATFORM=offscreen python3 tests/test_server_cards.py
+"""
+
+import os
+import sys
+import time
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+try:
+    from PySide6.QtWidgets import QApplication  # noqa: E402
+    HAS_QT = True
+except Exception:
+    HAS_QT = False
+
+
+def src(label, online=True, api=True, regions=None, req60=1, check_count=10, newest_known=None, error=""):
+    return {
+        "label": label, "url": f"http://{label}:8765", "online": online, "error": error, "active": True,
+        "api_available": api if online else None, "last_check": time.time() if online else None,
+        "check_count": check_count if online else None, "requests_last_60s": req60 if online else None,
+        "last_request_per_region": regions or {}, "inventory_known": 112 if online else 0,
+        "inventory_unknown": 0, "newest_known_checked": newest_known,
+    }
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 不可用")
+class TestServerCards(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+        import gui_app
+        cls.gui_app = gui_app
+
+    def _window(self, backup_url="http://100.70.21.76:8765"):
+        from PySide6.QtCore import QTimer
+        orig = QTimer.singleShot
+        QTimer.singleShot = staticmethod(lambda *a, **k: None)
+        try:
+            w = self.gui_app.MainWindow()
+        finally:
+            QTimer.singleShot = orig
+        w._cloud_active_urls = ("http://100.122.114.47:8765", backup_url)
+        return w
+
+    def _led(self, card):
+        return card.led.styleSheet()
+
+    def test_cards_exist_and_backup_unconfigured(self):
+        w = self._window(backup_url="")
+        self.assertIs(w.cloud_card, w.primary_card)
+        w._update_server_cards({"cloud_sources": [src("主", regions={"pickup_510000": 20.0})]}, True)
+        self.assertEqual(w.primary_card.value_label.text(), "在线·正常")
+        self.assertIn("最近请求 20s前 广东 ✓", w.primary_card.detail_label.text())
+        self.assertEqual(w.backup_card.value_label.text(), "未配置")
+        self.assertIn("#bdc3c7", self._led(w.backup_card))
+        self.assertIn("主 最近成功", w._server_tech_text)
+
+    def test_new_request_flashes_and_steady_otherwise(self):
+        w = self._window()
+        now = time.time()
+        first = {"cloud_sources": [src("主", regions={"pickup_510000": 100.0}), src("备", regions={"pickup_510000": 10.0})]}
+        w._update_server_cards(first, True)
+        # 首次快照：只记录，不闪
+        self.assertIn(w.LED_COLORS["green"][0], self._led(w.primary_card))
+        self.assertIn(w.LED_COLORS["green"][0], self._led(w.backup_card))
+        # 第二次：主没有新请求（ago 增加 10），备有新请求（ago 变小）
+        second = {"cloud_sources": [src("主", regions={"pickup_510000": 110.0}), src("备", regions={"pickup_510000": 3.0})]}
+        w._update_server_cards(second, True)
+        self.assertIn(w.LED_COLORS["green"][0], self._led(w.primary_card))   # 常亮暗绿
+        self.assertIn(w.LED_COLORS["green"][1], self._led(w.backup_card))    # 高亮闪烁
+        self.assertIn("最近请求 3s前 广东 ✓", w.backup_card.detail_label.text())
+
+    def test_throttled_server_shows_yellow_and_red_flash(self):
+        w = self._window()
+        w._update_server_cards({"cloud_sources": [src("主", regions={"pickup_510000": 50.0}), src("备", api=False, regions={"pickup_200000": 90.0})]}, True)
+        w._update_server_cards({"cloud_sources": [src("主", regions={"pickup_510000": 60.0}), src("备", api=False, regions={"pickup_200000": 2.0})]}, True)
+        self.assertEqual(w.backup_card.value_label.text(), "在线·限流")
+        self.assertIn(w.LED_COLORS["red"][1], self._led(w.backup_card))  # 失败请求红闪
+        self.assertIn("南京 ✗", w.backup_card.detail_label.text())
+
+    def test_idle_server_shows_yellow_no_request(self):
+        w = self._window()
+        w._update_server_cards({"cloud_sources": [src("主", regions={"pickup_510000": 30.0}), src("备", regions={"pickup_510000": 600.0})]}, True)
+        self.assertEqual(w.backup_card.value_label.text(), "在线·无请求")
+        self.assertIn("无请求 10 分钟", w.backup_card.detail_label.text())
+        self.assertIn(w.LED_COLORS["yellow"][0], self._led(w.backup_card))
+
+    def test_offline_source_and_all_offline(self):
+        w = self._window()
+        w._update_server_cards({"cloud_sources": [src("主", regions={"pickup_510000": 30.0}), src("备", online=False, error="timeout")]}, True)
+        self.assertEqual(w.backup_card.value_label.text(), "离线")
+        self.assertIn("timeout", w.backup_card.detail_label.text())
+        self.assertIn(w.LED_COLORS["red"][0], self._led(w.backup_card))
+        w._update_server_cards(None, False)
+        self.assertEqual(w.primary_card.value_label.text(), "离线")
+        self.assertEqual(w.backup_card.value_label.text(), "离线")
+
+    def test_single_source_status_without_cloud_sources(self):
+        w = self._window(backup_url="")
+        status = {"monitor": {"check_count": 5, "last_check": time.time()}, "pickup": {"api_available": True},
+                  "rate_limiter": {"global_requests_last_60s": 1, "last_request_per_region": {"pickup_210000": 7.0}},
+                  "inventory": {"k|R1": {"available": False, "last_checked": time.time() - 7}}}
+        w._update_server_cards(status, True)
+        self.assertEqual(w.primary_card.value_label.text(), "在线·正常")
+        self.assertIn("上海 ✓", w.primary_card.detail_label.text())
+        self.assertIn("累计 5", w.primary_card.detail_label.text())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

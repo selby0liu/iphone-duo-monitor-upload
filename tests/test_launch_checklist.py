@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+开售前检查清单测试（纯本地，不联网，不访问 Apple，不读任何浏览器数据）
+
+运行：
+  python3 tests/test_launch_checklist.py
+  或 QT_QPA_PLATFORM=offscreen python3 -m pytest tests/test_launch_checklist.py -v
+"""
+
+import os
+
+import sys
+import time
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import launch_checklist as lc  # noqa: E402
+
+NOW = 1_700_000_000.0
+SAFARI_APP = "/Applications/Safari.app"
+CHROME_APP = "/Applications/Google Chrome.app"
+
+
+def fake_exists(*present):
+    present = set(present)
+    return lambda path: path in present
+
+
+def confirmed(at=NOW):
+    return {"confirmed": True, "at": at}
+
+
+def state(browser="safari", manual=None, **kw):
+    base = {
+        "cloud_online": True, "cloud_healthy": True,
+        "pickup_ok": True, "pickup_ok_age": 12.0,
+        "checkout_enabled": True, "auto_open_buy_page": True, "auto_select_store": True,
+        "browser": browser, "prevent_sleep": True,
+        "sound_enabled": True, "bark_enabled": True,
+        "manual": manual or {}, "launch_mode": False,
+    }
+    base.update(kw)
+    return base
+
+
+def all_confirmed(browser, at=NOW):
+    return {k: confirmed(at) for k in lc.manual_keys(browser)}
+
+
+def by_key(items):
+    return {i["key"]: i for i in items}
+
+
+class TestBrowserTargeting(unittest.TestCase):
+    def test_safari_maps_to_safari_everything_else_to_chrome(self):
+        self.assertEqual(lc.target_browser("safari"), "safari")
+        self.assertEqual(lc.target_browser("SAFARI"), "safari")
+        self.assertEqual(lc.target_browser("default"), "chrome")
+        self.assertEqual(lc.target_browser(""), "chrome")
+        self.assertEqual(lc.target_browser(None), "chrome")
+
+    def test_safari_has_three_manual_items_chrome_has_two(self):
+        self.assertEqual(lc.manual_keys("safari"),
+                         ["safari_extension_enabled", "safari_unsigned_allowed", "apple_id_signed_in"])
+        self.assertEqual(lc.manual_keys("default"),
+                         ["chrome_extension_enabled", "apple_id_signed_in"])
+
+    def test_find_browser_only_checks_app_presence(self):
+        self.assertEqual(lc.find_browser("safari", exists=fake_exists(SAFARI_APP)), (True, SAFARI_APP))
+        self.assertEqual(lc.find_browser("chrome", exists=fake_exists(CHROME_APP)), (True, CHROME_APP))
+        self.assertEqual(lc.find_browser("chrome", exists=fake_exists(SAFARI_APP)), (False, ""))
+
+    def test_safari_restart_warning_exists(self):
+        self.assertIn("Safari 重启后未签名扩展可能失效", lc.SAFARI_RESTART_WARNING)
+        self.assertIn("开售前请重新确认", lc.SAFARI_RESTART_WARNING)
+
+
+class TestManualConfirmation(unittest.TestCase):
+    def test_unconfirmed_is_pending(self):
+        self.assertEqual(lc.manual_status({}, now=NOW), "manual_pending")
+        self.assertEqual(lc.manual_status({"confirmed": False, "at": NOW}, now=NOW), "manual_pending")
+
+    def test_fresh_confirmation_is_ok_and_old_one_goes_stale(self):
+        self.assertEqual(lc.manual_status(confirmed(NOW - 60), now=NOW), "manual_ok")
+        self.assertEqual(lc.manual_status(confirmed(NOW - lc.MANUAL_STALE_SECONDS + 10), now=NOW), "manual_ok")
+        self.assertEqual(lc.manual_status(confirmed(NOW - lc.MANUAL_STALE_SECONDS - 10), now=NOW), "manual_stale")
+
+    def test_manual_items_are_never_auto_satisfied(self):
+        """没有任何自动信号能把人工项变成已确认——哪怕浏览器和扩展都装好了"""
+        st = state("safari", manual={})
+        items = by_key(lc.build_checklist(st, now=NOW, exists=fake_exists(SAFARI_APP, lc.SAFARI_HELPER_APP)))
+        for key in lc.manual_keys("safari"):
+            self.assertTrue(items[key]["manual"])
+            self.assertEqual(items[key]["status"], "manual_pending")
+        self.assertFalse(lc.browser_env_ready(st, now=NOW, exists=fake_exists(SAFARI_APP, lc.SAFARI_HELPER_APP)))
+
+    def test_installed_helper_app_only_shows_up_as_a_hint(self):
+        e = fake_exists(SAFARI_APP, lc.SAFARI_HELPER_APP)
+        items = by_key(lc.build_checklist(state("safari"), now=NOW, exists=e))
+        row = items["safari_extension_enabled"]
+        self.assertIn("扩展 App 已安装", row["hint"])
+        self.assertEqual(row["status"], "manual_pending")   # 装了 ≠ 启用了
+
+    def test_missing_helper_app_is_called_out(self):
+        items = by_key(lc.build_checklist(state("safari"), now=NOW, exists=fake_exists(SAFARI_APP)))
+        self.assertIn("没找到", items["safari_extension_enabled"]["hint"])
+
+    def test_normalize_manual_drops_junk(self):
+        raw = {"a": {"confirmed": True, "at": 5, "secret": "x"}, "b": "nope",
+               "c": {"confirmed": "yes", "at": "bad"}, 7: {"confirmed": False}}
+        out = lc.normalize_manual(raw)
+        self.assertEqual(out["a"], {"confirmed": True, "at": 5.0})
+        self.assertNotIn("b", out)
+        self.assertEqual(out["c"], {"confirmed": True, "at": 0.0})
+        self.assertEqual(out["7"], {"confirmed": False, "at": 0.0})
+        self.assertEqual(lc.normalize_manual(None), {})
+
+
+class TestReadiness(unittest.TestCase):
+    def test_ready_only_when_browser_present_and_all_manual_confirmed(self):
+        e = fake_exists(SAFARI_APP)
+        self.assertTrue(lc.browser_env_ready(
+            state("safari", manual=all_confirmed("safari")), now=NOW, exists=e))
+        # 少勾一项就不就绪
+        partial = all_confirmed("safari")
+        del partial["apple_id_signed_in"]
+        self.assertFalse(lc.browser_env_ready(state("safari", manual=partial), now=NOW, exists=e))
+        # 过期的确认也不算就绪
+        stale = all_confirmed("safari")
+        stale["safari_unsigned_allowed"] = confirmed(NOW - lc.MANUAL_STALE_SECONDS - 1)
+        self.assertFalse(lc.browser_env_ready(state("safari", manual=stale), now=NOW, exists=e))
+        # 浏览器不在也不就绪
+        self.assertFalse(lc.browser_env_ready(
+            state("safari", manual=all_confirmed("safari")), now=NOW, exists=fake_exists()))
+
+    def test_chrome_needs_only_its_two_items(self):
+        e = fake_exists(CHROME_APP)
+        self.assertTrue(lc.browser_env_ready(
+            state("default", manual=all_confirmed("default")), now=NOW, exists=e))
+
+    def test_banner_wording_and_colour(self):
+        e = fake_exists(SAFARI_APP)
+        text, color, ready = lc.banner_text(
+            state("safari", manual=all_confirmed("safari")), now=NOW, exists=e)
+        self.assertEqual((text, ready), ("浏览器环境已就绪", True))
+        self.assertEqual(color, "#27ae60")
+
+        text, color, ready = lc.banner_text(state("safari"), now=NOW, exists=e)
+        self.assertTrue(text.startswith("浏览器环境未就绪"))
+        self.assertFalse(ready)
+        self.assertEqual(color, "#f39c12")
+
+        # 首发模式下未就绪要更显眼（红）
+        text, color, ready = lc.banner_text(
+            state("safari", launch_mode=True), now=NOW, exists=e)
+        self.assertTrue(text.startswith("浏览器环境未就绪"))
+        self.assertEqual(color, "#e74c3c")
+
+    def test_banner_names_the_pending_items(self):
+        e = fake_exists(SAFARI_APP)
+        partial = all_confirmed("safari")
+        del partial["safari_unsigned_allowed"]
+        text, _c, _r = lc.banner_text(state("safari", manual=partial), now=NOW, exists=e)
+        self.assertIn("允许未签名的扩展", text)
+        self.assertNotIn("Apple ID 已登录", text)
+
+
+class TestChecklistContents(unittest.TestCase):
+    EXPECTED_AUTO = ["cloud_online", "pickup_recent", "checkout_enabled",
+                     "browser_present", "prevent_sleep", "alerting"]
+
+    def test_safari_checklist_shape_and_order(self):
+        items = lc.build_checklist(state("safari"), now=NOW, exists=fake_exists(SAFARI_APP))
+        self.assertEqual([i["key"] for i in items],
+                         ["cloud_online", "pickup_recent", "checkout_enabled", "browser_present",
+                          "safari_extension_enabled", "safari_unsigned_allowed", "apple_id_signed_in",
+                          "prevent_sleep", "alerting"])
+
+    def test_chrome_checklist_shape_and_order(self):
+        items = lc.build_checklist(state("default"), now=NOW, exists=fake_exists(CHROME_APP))
+        self.assertEqual([i["key"] for i in items],
+                         ["cloud_online", "pickup_recent", "checkout_enabled", "browser_present",
+                          "chrome_extension_enabled", "apple_id_signed_in",
+                          "prevent_sleep", "alerting"])
+
+    def test_every_required_topic_is_present(self):
+        items = by_key(lc.build_checklist(state("safari"), now=NOW, exists=fake_exists(SAFARI_APP)))
+        for key in self.EXPECTED_AUTO:
+            self.assertIn(key, items)
+        self.assertTrue(any(i["manual"] for i in items.values()))
+
+    def test_cloud_and_pickup_states(self):
+        e = fake_exists(SAFARI_APP)
+        ok = by_key(lc.build_checklist(state("safari"), now=NOW, exists=e))
+        self.assertEqual(ok["cloud_online"]["status"], "ok")
+        self.assertEqual(ok["pickup_recent"]["status"], "ok")
+
+        degraded = by_key(lc.build_checklist(
+            state("safari", cloud_healthy=False), now=NOW, exists=e))
+        self.assertEqual(degraded["cloud_online"]["status"], "warn")
+
+        offline = by_key(lc.build_checklist(
+            state("safari", cloud_online=False, cloud_healthy=False), now=NOW, exists=e))
+        self.assertEqual(offline["cloud_online"]["status"], "fail")
+
+        stale = by_key(lc.build_checklist(
+            state("safari", pickup_ok_age=lc.PICKUP_FRESH_SECONDS + 1), now=NOW, exists=e))
+        self.assertEqual(stale["pickup_recent"]["status"], "warn")
+
+        unknown = by_key(lc.build_checklist(
+            state("safari", pickup_ok_age=None), now=NOW, exists=e))
+        self.assertEqual(unknown["pickup_recent"]["status"], "warn")
+
+    def test_checkout_and_alerting_states(self):
+        e = fake_exists(SAFARI_APP)
+        off = by_key(lc.build_checklist(state("safari", checkout_enabled=False), now=NOW, exists=e))
+        self.assertEqual(off["checkout_enabled"]["status"], "fail")
+
+        no_open = by_key(lc.build_checklist(
+            state("safari", auto_open_buy_page=False), now=NOW, exists=e))
+        self.assertEqual(no_open["checkout_enabled"]["status"], "warn")
+
+        silent = by_key(lc.build_checklist(
+            state("safari", sound_enabled=False, bark_enabled=False), now=NOW, exists=e))
+        self.assertEqual(silent["alerting"]["status"], "fail")
+
+        bark_only = by_key(lc.build_checklist(
+            state("safari", sound_enabled=False), now=NOW, exists=e))
+        self.assertEqual(bark_only["alerting"]["status"], "warn")
+
+    def test_missing_browser_is_a_failure_and_mentions_edge(self):
+        items = by_key(lc.build_checklist(
+            state("default"), now=NOW, exists=fake_exists("/Applications/Microsoft Edge.app")))
+        self.assertEqual(items["browser_present"]["status"], "fail")
+        self.assertIn("Edge", items["browser_present"]["hint"])
+
+    def test_prevent_sleep_states(self):
+        e = fake_exists(SAFARI_APP)
+        self.assertEqual(by_key(lc.build_checklist(state("safari"), now=NOW, exists=e))
+                         ["prevent_sleep"]["status"], "ok")
+        self.assertEqual(by_key(lc.build_checklist(state("safari", prevent_sleep=False), now=NOW, exists=e))
+                         ["prevent_sleep"]["status"], "warn")
+
+    def test_build_checklist_does_not_mutate_state(self):
+        st = state("safari", manual={"apple_id_signed_in": confirmed()})
+        import copy
+        before = copy.deepcopy(st)
+        lc.build_checklist(st, now=NOW, exists=fake_exists(SAFARI_APP))
+        self.assertEqual(st, before)
+
+
+class TestModuleIsOfflineAndPrivate(unittest.TestCase):
+    """
+    静态检查：自检模块不许联网、不许读浏览器数据、不许起子进程。
+    用 ast 精确分析导入、调用和字符串常量，而不是粗暴匹配整份源码——
+    给用户看的操作提示里出现 "apple.com.cn" 是正常的，那是叫他去哪儿看，不是请求目标。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        path = os.path.join(ROOT, "launch_checklist.py")
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), path)
+        # 文档字符串是写给人看的说明（里面会提到"不调用 fulfillment-messages"），不算代码
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc is not None:
+                    docstrings.add(doc)
+
+        cls.imports, cls.calls, cls.strings = set(), set(), []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and node.value in docstrings:
+                continue
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    cls.imports.add(a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                cls.imports.add((node.module or "").split(".")[0])
+            elif isinstance(node, ast.Call):
+                cls.calls.add(cls._callee(node.func))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                cls.strings.append(node.value)
+        # os.path.exists 是作为默认参数传进去的（exists=os.path.exists），不是 Call，单独收集
+        cls.attrs = {cls._callee(n) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+
+    @staticmethod
+    def _callee(node):
+        import ast
+        bits = []
+        while isinstance(node, ast.Attribute):
+            bits.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            bits.append(node.id)
+        return ".".join(reversed(bits))
+
+    def test_imports_only_os_and_time(self):
+        self.assertEqual(self.imports, {"os", "time"},
+                         f"自检模块只应 import os 和 time，实际: {sorted(self.imports)}")
+
+    def test_no_network_or_subprocess_calls(self):
+        for banned in ("urlopen", "socket", "requests.get", "subprocess.run",
+                       "subprocess.Popen", "os.system", "os.popen", "open"):
+            self.assertNotIn(banned, self.calls, f"自检模块不应调用 {banned}")
+
+    def test_no_url_with_a_scheme_anywhere(self):
+        """提示文字里可以写 apple.com.cn 让用户自己去看，但不能出现可请求的 URL"""
+        for s in self.strings:
+            self.assertNotIn("://", s, f"自检模块不应包含可请求的 URL: {s[:60]}")
+        for banned in ("pickup-message", "fulfillment-messages", "/shop/product"):
+            self.assertFalse(any(banned in s for s in self.strings),
+                             f"自检模块不应出现 Apple 接口 {banned}")
+
+    def test_no_browser_data_paths(self):
+        banned_paths = ("Cookies", "Login Data", "Keychain", "Safari/History",
+                        "Local Extension Settings", "Default/Preferences",
+                        "Library/Application Support/Google",
+                        "Library/Safari", "Library/Cookies")
+        for s in self.strings:
+            for banned in banned_paths:
+                self.assertNotIn(banned, s, f"自检模块不应触碰 {banned}")
+
+    def test_only_filesystem_probe_is_path_existence(self):
+        """唯一的文件系统动作是判断 .app 路径存不存在，不读目录、不读文件内容"""
+        self.assertIn("os.path.exists", self.attrs)
+        os_used = {c for c in self.calls | self.attrs if c.startswith("os.")}
+        allowed = {"os.path.exists", "os.path.expanduser", "os.path.join",
+                   "os.path.dirname", "os.path.abspath", "os.path"}
+        self.assertEqual(os_used - allowed, set(),
+                         f"自检模块用了计划外的 os 接口: {sorted(os_used - allowed)}")
+
+
+# ----------------------------------------------------------------------
+# GUI 集成（离屏；确认清单只提示、不阻断监控、不改 Checkout 行为）
+# ----------------------------------------------------------------------
+
+try:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication  # noqa: E402
+    HAS_QT = True
+except Exception:
+    HAS_QT = False
+
+
+class FakeOpener:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, url, browser):
+        self.calls.append((url, browser))
+        return True
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 不可用，跳过 GUI 集成测试")
+class TestGuiChecklist(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+        import gui_app
+        cls.gui_app = gui_app
+
+    def _window(self):
+        from PySide6.QtCore import QTimer
+        orig = QTimer.singleShot
+        QTimer.singleShot = staticmethod(lambda *a, **k: None)
+        try:
+            w = self.gui_app.MainWindow()
+        finally:
+            QTimer.singleShot = orig
+        w._save_message_history = lambda: None
+        w._persist_checkout_config = lambda: None
+        w._persist_launch_check = lambda: None
+        w._send_macos_notification = lambda *a, **k: None
+        w._play_alert_sound = lambda *a, **k: None
+        w._open_buy_page = lambda sku_id: None
+        w._launch_manual = {}
+        w.checkout.enabled = True
+        w.checkout.auto_open_page = True
+        w.checkout.quiet_hours = ""
+        w.checkout.open_only_priority = False
+        w.checkout.priority_bypass_cooldown = False
+        return w
+
+    def _visible_keys(self, w):
+        return [k for k in w._launch_row_order if w._launch_rows[k]["widget"].isVisibleTo(w)]
+
+    def test_safari_shows_three_manual_rows_and_the_restart_warning(self):
+        w = self._window()
+        w.checkout.browser = "safari"
+        w._update_launch_checklist()
+        keys = self._visible_keys(w)
+        for key in ("safari_extension_enabled", "safari_unsigned_allowed", "apple_id_signed_in"):
+            self.assertIn(key, keys)
+            self.assertIsNotNone(w._launch_rows[key]["check"], f"{key} 必须是可勾选的人工项")
+        self.assertTrue(w.launch_warning.isVisibleTo(w))
+        self.assertIn("浏览器环境未就绪", w.launch_banner.text())
+
+    def test_chrome_shows_two_manual_rows_and_hides_the_safari_warning(self):
+        w = self._window()
+        w.checkout.browser = "default"
+        w._update_launch_checklist()
+        keys = self._visible_keys(w)
+        self.assertIn("chrome_extension_enabled", keys)
+        self.assertIn("apple_id_signed_in", keys)
+        self.assertNotIn("safari_unsigned_allowed", keys)
+        self.assertFalse(w.launch_warning.isVisibleTo(w))
+
+    def test_rows_keep_a_fixed_order_across_browser_switches(self):
+        w = self._window()
+        expected_tail = ["prevent_sleep", "alerting"]
+        for browser in ("default", "safari", "default", "safari"):
+            w.checkout.browser = browser
+            w._update_launch_checklist()
+            keys = []
+            for i in range(w.launch_rows_layout.count()):
+                widget = w.launch_rows_layout.itemAt(i).widget()
+                for k, row in w._launch_rows.items():
+                    if row["widget"] is widget and widget.isVisibleTo(w):
+                        keys.append(k)
+            self.assertEqual(keys[:4],
+                             ["cloud_online", "pickup_recent", "checkout_enabled", "browser_present"])
+            self.assertEqual(keys[-2:], expected_tail)
+
+    def test_ticking_all_manual_items_turns_the_banner_green(self):
+        w = self._window()
+        w.checkout.browser = "safari"
+        w._update_launch_checklist()
+        for key in lc.manual_keys("safari"):
+            w._launch_rows[key]["check"].setChecked(True)
+        w._update_launch_checklist()
+        self.assertEqual(w.launch_banner.text(), "浏览器环境已就绪")
+        for key in lc.manual_keys("safari"):
+            self.assertTrue(w._launch_manual[key]["confirmed"])
+            self.assertGreater(w._launch_manual[key]["at"], 0)
+
+    def test_unticking_clears_the_confirmation(self):
+        w = self._window()
+        w.checkout.browser = "safari"
+        w._update_launch_checklist()
+        cb = w._launch_rows["apple_id_signed_in"]["check"]
+        cb.setChecked(True)
+        self.assertTrue(w._launch_manual["apple_id_signed_in"]["confirmed"])
+        cb.setChecked(False)
+        self.assertFalse(w._launch_manual["apple_id_signed_in"]["confirmed"])
+
+    def test_launch_mode_only_changes_the_banner_colour(self):
+        w = self._window()
+        w.checkout.browser = "safari"
+        before = w.checkout.to_config()
+        w.launch_mode_cb.setChecked(True)
+        self.assertTrue(w._launch_mode)
+        self.assertIn("浏览器环境未就绪", w.launch_banner.text())
+        self.assertIn("#e74c3c", w.launch_banner.styleSheet())
+        self.assertEqual(w.checkout.to_config(), before, "首发模式不得改动 Checkout 配置")
+
+    def test_unconfirmed_checklist_never_blocks_monitoring_or_checkout(self):
+        """人工项一个没勾，Pickup 监控和 Checkout 自动打开都必须照常工作"""
+        w = self._window()
+        w.checkout.browser = "safari"
+        w._launch_mode = True
+        w._update_launch_checklist()
+        self.assertIn("浏览器环境未就绪", w.launch_banner.text())
+
+        opener = FakeOpener()
+        w.checkout._opener = opener
+        inv_off = {"duo_512_starlight|R484": {"available": False, "detail": {"store_name": "x"}}}
+        inv_on = {"duo_512_starlight|R484": {"available": True, "detail": {"store_name": "x"}}}
+        w._detect_cloud_inventory_changes(inv_off)
+        w._detect_cloud_inventory_changes(inv_on)
+        self.assertEqual(len(opener.calls), 1, "未就绪不应阻止 Checkout 打开购买页")
+        self.assertEqual(opener.calls[0][1], "safari", "不得擅自切换浏览器")
+        self.assertTrue(w.checkout.enabled)
+
+    def test_checklist_never_touches_the_network_or_apple(self):
+        """自检刷新过程中不产生任何请求：把可能的出口全部替换成炸弹"""
+        w = self._window()
+        boom = lambda *a, **k: self.fail("自检不应发起任何请求或子进程")
+        import subprocess as sp
+        import urllib.request as ur
+        orig = (sp.run, sp.Popen, ur.urlopen)
+        sp.run, sp.Popen, ur.urlopen = boom, boom, boom
+        try:
+            for browser in ("safari", "default"):
+                w.checkout.browser = browser
+                w._update_launch_checklist()
+        finally:
+            sp.run, sp.Popen, ur.urlopen = orig
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 不可用，跳过 GUI 集成测试")
+class TestManualGrabMode(unittest.TestCase):
+    """
+    首发当晚的手动抢购模式：暂停自动开页和门店助手，
+    但 Cloud 监控、消息栏、系统通知、Bark 全部照常。
+    背景：查到的实战资料说开售瞬间频繁刷新/自动点击会被判定异常限流，
+    而那一刻你本来就自己盯着，App 弹页只会抢焦点添乱。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+        import gui_app
+        cls.gui_app = gui_app
+
+    def _window(self, auto_open=True, auto_select=True):
+        from PySide6.QtCore import QTimer
+        orig = QTimer.singleShot
+        QTimer.singleShot = staticmethod(lambda *a, **k: None)
+        try:
+            w = self.gui_app.MainWindow()
+        finally:
+            QTimer.singleShot = orig
+        w._save_message_history = lambda: None
+        w._persist_checkout_config = lambda: None
+        w._persist_launch_check = lambda: None
+        w._send_macos_notification = lambda *a, **k: None
+        w._play_alert_sound = lambda *a, **k: None
+        w._open_buy_page = lambda sku_id: None
+        w._message_history = []
+        w._manual_grab = {"active": False, "since": 0.0,
+                          "saved": {"auto_open_buy_page": True, "auto_select_store": False}}
+        w.manual_grab_cb.blockSignals(True)
+        w.manual_grab_cb.setChecked(False)
+        w.manual_grab_cb.blockSignals(False)
+        c = w.checkout
+        c.enabled = True
+        c.auto_open_page = auto_open
+        c.auto_select_store = auto_select
+        c.quiet_hours = ""
+        c.browser = "default"
+        c.priority_tier1 = ["R793", "R484", "R761"]
+        c.priority_tier2 = ["R577", "R639"]
+        c.open_only_priority = True
+        return w
+
+    @staticmethod
+    def _inv(available):
+        return {"iphone18pm_512_glacier|R577": {
+            "available": available,
+            "detail": {"store_name": "天环广场", "pickup_search_quote": "今天可取货",
+                       "store_pickup_quote": "今天可取货"}}}
+
+    def test_turning_on_pauses_both_switches(self):
+        w = self._window(auto_open=True, auto_select=True)
+        w.manual_grab_cb.setChecked(True)
+        self.assertTrue(w._manual_grab["active"])
+        self.assertFalse(w.checkout.auto_open_page)
+        self.assertFalse(w.checkout.auto_select_store)
+        self.assertEqual(w._manual_grab["saved"],
+                         {"auto_open_buy_page": True, "auto_select_store": True})
+        self.assertGreater(w._manual_grab["since"], 0)
+
+    def test_turning_off_restores_exactly_what_was_there(self):
+        """故意用一组不对称的原值，确认不是粗暴地「全部打开」"""
+        w = self._window(auto_open=True, auto_select=False)
+        w.manual_grab_cb.setChecked(True)
+        self.assertFalse(w.checkout.auto_open_page)
+        w.manual_grab_cb.setChecked(False)
+        self.assertTrue(w.checkout.auto_open_page)
+        self.assertFalse(w.checkout.auto_select_store, "原来是关的，不许被顺手打开")
+        self.assertFalse(w._manual_grab["active"])
+
+    def test_monitoring_and_bark_keep_working_while_paused(self):
+        """这一条是这个模式的核心：只停开页，不停监控和推送"""
+        w = self._window()
+        opener = FakeOpener()
+        w.checkout._opener = opener
+        pushed = []
+        w.checkout.set_bark_config({"enabled": True, "url": "https://api.day.app/TESTKEY"})
+        w.checkout._pusher = lambda p: pushed.append(p) or True
+        w.manual_grab_cb.setChecked(True)
+
+        w._detect_cloud_inventory_changes(self._inv(False))
+        w._detect_cloud_inventory_changes(self._inv(True))
+
+        self.assertEqual(opener.calls, [], "手动抢购模式下不许自动开页")
+        self.assertEqual(len(pushed), 1, "Bark 必须照常推送到手机")
+        self.assertTrue(any("有货" in str(m.get("status")) for m in w._message_history),
+                        "消息栏必须照常记录有货")
+
+    def test_paused_mode_does_not_touch_other_settings(self):
+        w = self._window()
+        before = (w.checkout.enabled, w.checkout.browser, w.checkout.bark_enabled(),
+                  w.checkout.cooldown_seconds, w.checkout.max_tabs_per_wave,
+                  w.checkout.priority_tier1, w.checkout.open_only_priority)
+        w.manual_grab_cb.setChecked(True)
+        after = (w.checkout.enabled, w.checkout.browser, w.checkout.bark_enabled(),
+                 w.checkout.cooldown_seconds, w.checkout.max_tabs_per_wave,
+                 w.checkout.priority_tier1, w.checkout.open_only_priority)
+        self.assertEqual(before, after, "只许动两个开关，其它一律不碰")
+
+    def test_expires_and_restores_itself(self):
+        """忘了关的兜底：超过上限自动恢复，不至于白守一个月"""
+        w = self._window(auto_open=True, auto_select=True)
+        w.manual_grab_cb.setChecked(True)
+        self.assertFalse(w.checkout.auto_open_page)
+        w._manual_grab["since"] = time.time() - (self.gui_app.MANUAL_GRAB_MAX_SECONDS + 10)
+        w._update_launch_checklist()
+        self.assertFalse(w._manual_grab["active"], "超时后应自动恢复")
+        self.assertTrue(w.checkout.auto_open_page)
+        self.assertTrue(w.checkout.auto_select_store)
+        self.assertFalse(w.manual_grab_cb.isChecked(), "勾选框也要跟着复位")
+
+    def test_not_yet_expired_stays_active(self):
+        w = self._window()
+        w.manual_grab_cb.setChecked(True)
+        w._manual_grab["since"] = time.time() - (self.gui_app.MANUAL_GRAB_MAX_SECONDS - 60)
+        w._update_launch_checklist()
+        self.assertTrue(w._manual_grab["active"], "没到上限不该提前恢复")
+        self.assertFalse(w.checkout.auto_open_page)
+
+    def test_warning_is_visible_only_while_active(self):
+        w = self._window()
+        w._update_launch_checklist()
+        self.assertFalse(w.manual_grab_warning.isVisibleTo(w))
+        w.manual_grab_cb.setChecked(True)
+        self.assertTrue(w.manual_grab_warning.isVisibleTo(w))
+        self.assertIn("手动抢购模式开启中", w.manual_grab_warning.text())
+        w.manual_grab_cb.setChecked(False)
+        self.assertFalse(w.manual_grab_warning.isVisibleTo(w))
+
+    def test_checkout_tab_checkboxes_stay_in_sync(self):
+        """Checkout 标签页上的勾选框不能和实际状态脱节"""
+        w = self._window(auto_open=True, auto_select=True)
+        w.manual_grab_cb.setChecked(True)
+        self.assertFalse(w.checkout_auto_open_cb.isChecked())
+        self.assertFalse(w.checkout_auto_select_cb.isChecked())
+        w.manual_grab_cb.setChecked(False)
+        self.assertTrue(w.checkout_auto_open_cb.isChecked())
+        self.assertTrue(w.checkout_auto_select_cb.isChecked())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

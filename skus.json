@@ -1,0 +1,89 @@
+{
+  "_comment": "SKU 配置。enabled 控制是否监控。Duo 为主监控目标（30秒/区域），18 Pro Max 为低频监控（60秒/区域）。所有 Part Number 均经 Apple 官方验证。",
+  "skus": [
+    {
+      "id": "duo_512_starlight",
+      "name": "iPhone Duo 512GB 星光白色",
+      "part_number": "MK2P4CH/A",
+      "capacity": "512GB",
+      "color": "星光白色",
+      "group": "duo",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple product-locator-meta API + pickup-message API",
+      "verified_date": "2026-09-11"
+    },
+    {
+      "id": "duo_512_midnight",
+      "name": "iPhone Duo 512GB 夜空色",
+      "part_number": "MK2Q4CH/A",
+      "capacity": "512GB",
+      "color": "夜空色",
+      "group": "duo",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple product-locator-meta API + pickup-message API",
+      "verified_date": "2026-09-11"
+    },
+    {
+      "id": "duo_1tb_starlight",
+      "name": "iPhone Duo 1TB 星光白色",
+      "part_number": "MK2T4CH/A",
+      "capacity": "1TB",
+      "color": "星光白色",
+      "group": "duo",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple product-locator-meta API",
+      "verified_date": "2026-09-11"
+    },
+    {
+      "id": "duo_1tb_midnight",
+      "name": "iPhone Duo 1TB 夜空色",
+      "part_number": "MK2U4CH/A",
+      "capacity": "1TB",
+      "color": "夜空色",
+      "group": "duo",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple product-locator-meta API",
+      "verified_date": "2026-09-11"
+    },
+    {
+      "id": "iphone18pm_512_silver",
+      "name": "iPhone 18 Pro Max 512GB 银色",
+      "part_number": "MJYC4CH/A",
+      "capacity": "512GB",
+      "color": "银色",
+      "group": "iphone18promax",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple 中国官网购买页 JSON 数据 (familyType=iphone18promax, dimensionCapacity=512gb, dimensionColor=silver)",
+      "verified_date": "2026-09-12"
+    },
+    {
+      "id": "iphone18pm_512_glacier",
+      "name": "iPhone 18 Pro Max 512GB 冰川色",
+      "part_number": "MJYE4CH/A",
+      "capacity": "512GB",
+      "color": "冰川色",
+      "group": "iphone18promax",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple 中国官网购买页 JSON 数据 (familyType=iphone18promax, dimensionCapacity=512gb, dimensionColor=glacier)",
+      "verified_date": "2026-09-12"
+    },
+    {
+      "id": "iphone18pm_512_burgundy",
+      "name": "iPhone 18 Pro Max 512GB 酒红色",
+      "part_number": "MJYD4CH/A",
+      "capacity": "512GB",
+      "color": "酒红色",
+      "group": "iphone18promax",
+      "enabled": true,
+      "verified": true,
+      "verified_source": "Apple 中国官网购买页 JSON 数据 (familyType=iphone18promax, dimensionCapacity=512gb, dimensionColor=burgundy)",
+      "verified_date": "2026-09-12"
+    }
+  ]
+}

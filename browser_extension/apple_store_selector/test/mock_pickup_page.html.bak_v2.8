@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mock pickup panel</title>
+<style>
+  body { font: 13px -apple-system, sans-serif; margin: 8px; }
+  label { display: inline-block; margin-right: 12px; }
+</style>
+</head>
+<body>
+<!-- 假的 Apple 购买页取货面板：只用来测 content.js，不联网、不碰 Apple -->
+<button id="continue" data-autom="continuePickUp">继续</button>
+<button id="atb" data-autom="add-to-cart">加入购物袋</button>
+<div id="panel"></div>
+
+<script>
+// 1) 点击探针：记录页面上被点击的每一个元素（捕获阶段），用来证明只点了门店 radio
+(function () {
+  var q = new URLSearchParams(location.search);
+  var clicks = [];
+  document.addEventListener("click", function (e) {
+    var t = e.target || {};
+    clicks.push((t.tagName || "?") + (t.id ? "#" + t.id : "") +
+      (t.name ? "[name=" + t.name + "]" : "") + (t.value ? "[value=" + t.value + "]" : ""));
+  }, true);
+  window.__clicks = clicks;
+
+  // 2) 测试注入点（线上的隔离世界里页面写不进这个对象，只有本地测试直接加载 content.js 时才生效）
+  window.__DUOMONITOR_TEST__ = {
+    panelTimeoutMs: +(q.get("timeout") || 900),
+    settleMs: +(q.get("settle") || 300),
+    pollMs: +(q.get("poll") || 40),
+    onDone: function (outcome) {
+      parent.postMessage({
+        type: "duomonitor-test",
+        name: q.get("name") || "",
+        outcome: outcome,
+        clicks: clicks.slice(),
+        hash: location.hash,
+        path: location.pathname + location.search
+      }, "*");
+    }
+  };
+})();
+</script>
+
+<script src="../content.js"></script>
+
+<script>
+// 3) 延迟渲染门店列表，模拟 Apple 自己把“查看供货情况”的门店列表加载出来
+(function () {
+  var NAMES = {
+    R761: "深圳万象城", R793: "深圳前海壹方城", R484: "深圳益田假日广场",
+    R577: "广州天环广场", R639: "广州珠江新城"
+  };
+  var q = new URLSearchParams(location.search);
+  var spec = q.get("stores") || "";
+  var delay = +(q.get("delay") || 120);
+  var part = "MG704CH/A";
+  if (!spec) { return; }  // 门店列表永远不出现
+  setTimeout(function () {
+    var panel = document.getElementById("panel");
+    spec.split(",").forEach(function (item, idx) {
+      var bits = item.split(":");
+      var sn = bits[0];
+      var mode = bits[1] || "ok";
+      var id = "store-radio-" + idx;
+      var input = document.createElement("input");
+      input.type = "radio";
+      input.name = "store-" + part;
+      input.value = sn;
+      input.id = id;
+      if (mode === "off") { input.disabled = true; }
+      if (mode === "aria") { input.setAttribute("aria-disabled", "true"); }
+      if (mode === "checked") { input.checked = true; }
+      var label = document.createElement("label");
+      label.setAttribute("for", id);
+      label.textContent = NAMES[sn] || sn;
+      panel.appendChild(input);
+      panel.appendChild(label);
+    });
+  }, delay);
+})();
+</script>
+</body>
+</html>

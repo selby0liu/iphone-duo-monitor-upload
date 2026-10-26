@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Apple 中国大陆官方库存 API 封装
+- 到店取货: pickup-message API
+- 官网配送: fulfillment-messages API（回退到 pickup-message availability 字段）
+- Part Number 验证: product-locator-meta API
+"""
+
+import json
+import time
+import logging
+import socket
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+class AppleAPIError(Exception):
+    """Apple API 错误"""
+    pass
+
+
+class AppleCNAPI:
+    """Apple 中国大陆官方 API 客户端"""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.monitor_cfg = config.get("monitor", {})
+        self.pickup_cfg = config.get("pickup", {})
+        self.delivery_cfg = config.get("delivery", {})
+        self.timeout = self.monitor_cfg.get("request_timeout", 10)
+        self.max_retries = self.monitor_cfg.get("max_retries", 3)
+        self.backoff_base = self.monitor_cfg.get("backoff_base_seconds", 2)
+        self.session = requests.Session()
+        # v1.3.2: 移除 force_ipv4() 全局 patch。
+        # 该 patch 在 Superloop 下可能有用，但在 Telstra 等网络下强制 IPv4 反而返回 541。
+        # 让系统自动选择 IPv4/IPv6 更稳定。
+        # 初始化浏览器级请求头
+        self._apply_browser_headers()
+
+    def _apply_browser_headers(self, referer: str = "https://www.apple.com.cn/shop/buy-iphone/iphone-duo"):
+        """应用真实 Chrome 浏览器请求头，减少被 WAF 识别为机器人的概率。"""
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": referer,
+            "Origin": "https://www.apple.com.cn",
+            "Connection": "keep-alive",
+            "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        })
+        # 设置 geo=CN cookie
+        self.session.cookies.set("geo", "CN", domain=".apple.com.cn")
+
+    def clear_session(self):
+        """清除所有 cookies，网络切换时调用（v1.3.3）"""
+        self.session.cookies.clear()
+        self._apply_browser_headers()
+
+    def _reset_session_cookies(self):
+        """v2.3.1: 541/503/403后清除cookie并重置geo=CN，避免Apple设置的风控cookie导致持续541。
+        只清除cookie，不重建session，保持连接复用。"""
+        self.session.cookies.clear()
+        self.session.cookies.set("geo", "CN", domain=".apple.com.cn")
+
+    def _request_with_retry(self, url: str, params: dict,
+                            no_retry_status: tuple = (404, 541, 503),
+                            module: str = "unknown",
+                            location: str = "") -> Optional[dict]:
+        """带退避重试的 GET 请求。no_retry_status 中的状态码不重试，直接返回 None。
+        v1.4.0: 每次请求都写审计日志（含成功和失败）。"""
+        for attempt in range(self.max_retries):
+            start_time = time.time()
+            http_status = None
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+                http_status = resp.status_code
+                latency = time.time() - start_time
+
+                if resp.status_code == 200:
+                    # v1.4.0: 成功请求审计日志
+                    logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=200 | latency=%.2fs | attempt=%d/%d",
+                                module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                                location, latency, attempt + 1, self.max_retries)
+                    try:
+                        return resp.json()
+                    except json.JSONDecodeError:
+                        logger.warning("响应不是 JSON，状态码: %s", resp.status_code)
+                        return None
+                elif resp.status_code in no_retry_status:
+                    # v1.4.0: 失败请求审计日志
+                    logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=%d | latency=%.2fs | attempt=%d/%d",
+                                module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                                location, resp.status_code, latency, attempt + 1, self.max_retries)
+                    logger.debug("HTTP %s（不重试）: %s", resp.status_code, url)
+                    # v2.3.1: 541/503后清除session cookie，避免Apple设置的风控cookie导致持续541
+                    if resp.status_code in (541, 503, 403):
+                        self._reset_session_cookies()
+                    return None
+                elif resp.status_code in (403, 429):
+                    logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=%d | latency=%.2fs | attempt=%d/%d",
+                                module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                                location, resp.status_code, latency, attempt + 1, self.max_retries)
+                    # v2.3.1: 403/429也清除cookie
+                    self._reset_session_cookies()
+                    wait = self.backoff_base * (2 ** attempt)
+                    logger.warning("限流 %s，%s 秒后重试（第 %d/%d 次）",
+                                   resp.status_code, wait, attempt + 1, self.max_retries)
+                    time.sleep(wait)
+                elif resp.status_code >= 500:
+                    logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=%d | latency=%.2fs | attempt=%d/%d",
+                                module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                                location, resp.status_code, latency, attempt + 1, self.max_retries)
+                    wait = self.backoff_base * (2 ** attempt)
+                    logger.warning("服务器错误 %s，%s 秒后重试（第 %d/%d 次）",
+                                   resp.status_code, wait, attempt + 1, self.max_retries)
+                    time.sleep(wait)
+                else:
+                    logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=%d | latency=%.2fs | attempt=%d/%d",
+                                module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                                location, resp.status_code, latency, attempt + 1, self.max_retries)
+                    logger.warning("HTTP %s: %s", resp.status_code, url)
+                    return None
+            except requests.exceptions.Timeout:
+                latency = time.time() - start_time
+                logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=TIMEOUT | latency=%.2fs | attempt=%d/%d",
+                            module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                            location, latency, attempt + 1, self.max_retries)
+                wait = self.backoff_base * (2 ** attempt)
+                logger.warning("请求超时，%s 秒后重试（第 %d/%d 次）",
+                               wait, attempt + 1, self.max_retries)
+                time.sleep(wait)
+            except requests.exceptions.RequestException as e:
+                latency = time.time() - start_time
+                logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=NETWORK_ERROR | latency=%.2fs | error=%s",
+                            module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                            location, latency, str(e)[:100])
+                logger.error("请求异常: %s", e)
+                return None
+        return None
+
+    def _request_raw_with_retry(self, url: str, module: str = "unknown",
+                                 location: str = "") -> Optional[requests.Response]:
+        """带退避重试的原始 GET 请求，返回 Response 对象（用于页面解析）。"""
+        for attempt in range(self.max_retries):
+            start_time = time.time()
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+                latency = time.time() - start_time
+                logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=%d | latency=%.2fs | attempt=%d/%d",
+                            module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                            location, resp.status_code, latency, attempt + 1, self.max_retries)
+                if resp.status_code == 200:
+                    return resp
+                elif resp.status_code in (404, 541, 503):
+                    # v2.3.1: 541/503后清除cookie
+                    if resp.status_code in (541, 503):
+                        self._reset_session_cookies()
+                    return resp
+                elif resp.status_code in (403, 429) or resp.status_code >= 500:
+                    # v2.3.1: 403也清除cookie
+                    if resp.status_code == 403:
+                        self._reset_session_cookies()
+                    wait = self.backoff_base * (2 ** attempt)
+                    time.sleep(wait)
+                else:
+                    return resp
+            except requests.exceptions.Timeout:
+                latency = time.time() - start_time
+                logger.info("HTTP_REQUEST | module=%s | endpoint=%s | location=%s | status=TIMEOUT | latency=%.2fs | attempt=%d/%d",
+                            module, url.split("apple.com.cn")[-1] if "apple.com.cn" in url else url,
+                            location, latency, attempt + 1, self.max_retries)
+                time.sleep(self.backoff_base * (2 ** attempt))
+            except requests.exceptions.RequestException as e:
+                logger.error("请求异常: %s", e)
+                return None
+        return None
+
+    def check_pickup_availability(self, part_numbers: List[str],
+                                   postcode: str) -> Tuple[List[dict], Optional[dict]]:
+        """
+        查询到店取货库存
+        返回: (stores_list, availability_info)
+        stores_list: 每家门店的库存信息
+        availability_info: 全局 availability 字段（isComingSoon 等）
+        """
+        url = self.pickup_cfg.get("api_url",
+            "https://www.apple.com.cn/shop/retail/pickup-message")
+        params = {"pl": "true", "location": postcode}
+        for i, pn in enumerate(part_numbers):
+            params[f"parts.{i}"] = pn
+
+        # 动态 Referer：包含18 Pro Max(MJY开头)时用iphone-18-pro页面，否则用iphone-duo
+        has_18pm = any(pn.startswith("MJY") for pn in part_numbers)
+        referer = ("https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro"
+                   if has_18pm else
+                   "https://www.apple.com.cn/shop/buy-iphone/iphone-duo")
+        self.session.headers["Referer"] = referer
+
+        data = self._request_with_retry(url, params, module="pickup", location=postcode)
+        if data is None:
+            raise AppleAPIError("pickup-message API 不可用（可能是 541 区域限制、403 限流或网络超时）")
+
+        body = data.get("body", {})
+        stores = body.get("stores", [])
+        availability = body.get("availability")
+
+        result_stores = []
+        for store in stores:
+            store_info = {
+                "store_number": store.get("storeNumber", ""),
+                "store_name": store.get("storeName", "").strip(),
+                "city": store.get("city", ""),
+                "state": store.get("state", ""),
+                "address": store.get("address", {}).get("address2", ""),
+                "parts": {}
+            }
+            parts_avail = store.get("partsAvailability", {})
+            for pn, pa in parts_avail.items():
+                regular = pa.get("messageTypes", {}).get("regular", {})
+                store_info["parts"][pn] = {
+                    "part_number": pn,
+                    "product_title": pa.get("storePickupProductTitle",
+                                            regular.get("storePickupProductTitle", "")),
+                    "pickup_display": pa.get("pickupDisplay", ""),
+                    "pickup_search_quote": pa.get("pickupSearchQuote", ""),
+                    "store_selection_enabled": regular.get("storeSelectionEnabled", False),
+                    "store_search_enabled": regular.get("storeSearchEnabled", False),
+                    "store_pickup_quote": regular.get("storePickupQuote", ""),
+                    "base_part_number": pa.get("basePartNumber", ""),
+                }
+            result_stores.append(store_info)
+
+        return result_stores, availability
+
+    def check_delivery_availability(self, part_numbers: List[str],
+                                     location: str = "510000",
+                                     cached_availability: dict = None) -> Dict[str, dict]:
+        """
+        查询官网配送库存
+        优先使用 fulfillment-messages API，若不可用则回退到 pickup-message 的 availability 字段
+        cached_availability: 如果已从 pickup 请求获取了 availability 字段，直接传入复用，避免重复请求
+        返回: {part_number: {available, message, delivery_date, source}}
+        """
+        results = {}
+        for pn in part_numbers:
+            results[pn] = {
+                "available": None,  # 默认未知，API失败时保持未知
+                "message": "",
+                "delivery_date": "",
+                "source": "unknown",
+                "is_coming_soon": None,
+            }
+
+        # 尝试 fulfillment API（404/541 不重试，因为中国大陆该端点可能不可用）
+        url = self.delivery_cfg.get("api_url",
+            "https://www.apple.com.cn/shop/fulfillment-messages")
+        params = {
+            "fae": "true",
+            "pl": "true",
+            "mt": "regular",
+            "location": location,
+        }
+        for i, pn in enumerate(part_numbers):
+            params[f"parts.{i}"] = pn
+
+        data = self._request_with_retry(url, params, no_retry_status=(404, 541, 503),
+                                         module="delivery", location=location)
+        if data is None:
+            raise AppleAPIError("fulfillment API 不可用（541/403/超时）")
+        if isinstance(data, dict):
+            body = data.get("body", {})
+            content = body.get("content", {}) if isinstance(body, dict) else {}
+            delivery_msg = content.get("deliveryMessage") if isinstance(content, dict) else None
+            if delivery_msg:
+                for pn in part_numbers:
+                    dm = delivery_msg.get(pn, {})
+                    results[pn] = {
+                        "available": dm.get("isAvailable", False),
+                        "message": dm.get("quote", ""),
+                        "delivery_date": dm.get("deliveryDate", ""),
+                        "source": "fulfillment-api",
+                        "is_coming_soon": dm.get("isComingSoon"),
+                    }
+                return results
+
+        # 回退：使用 pickup-message 的 availability 字段
+        if self.delivery_cfg.get("fallback_to_pickup_availability", True):
+            availability = cached_availability
+            if availability is None:
+                # 没有缓存时才单独请求
+                _, availability = self.check_pickup_availability(part_numbers, location)
+
+            if availability:
+                is_coming_soon = availability.get("isComingSoon", False)
+                coming_soon_text = availability.get("comingSoonText", "")
+                for pn in part_numbers:
+                    if is_coming_soon:
+                        results[pn] = {
+                            "available": False,
+                            "message": coming_soon_text or "即将发售，暂不可购买",
+                            "delivery_date": "",
+                            "source": "pickup-availability-fallback",
+                            "is_coming_soon": True,
+                        }
+                    else:
+                        # 已发售，但 pickup availability 字段不含配送库存信息
+                        # 不能简单认为有货，标记为未知
+                        results[pn] = {
+                            "available": None,
+                            "message": "已发售，配送状态未知",
+                            "delivery_date": "",
+                            "source": "pickup-availability-fallback",
+                            "is_coming_soon": False,
+                        }
+            else:
+                raise AppleAPIError("配送查询失败：fulfillment API 和 pickup availability 均不可用")
+
+        return results
+
+    def verify_part_numbers(self, family: str = "iphoneduo") -> List[dict]:
+        """
+        通过 product-locator-meta API 验证 Part Number
+        返回该 family 下所有产品的 partNumber 和 productTitle
+        """
+        url = "https://www.apple.com.cn/shop/product-locator-meta"
+        params = {"family": family}
+        data = self._request_with_retry(url, params, module="product_locator", location=family)
+        if data is None:
+            return []
+
+        try:
+            products = (data.get("body", {})
+                        .get("productLocatorOverlayData", {})
+                        .get("productLocatorMeta", {})
+                        .get("products", []))
+            return [{"partNumber": p.get("partNumber", ""),
+                     "productTitle": p.get("productTitle", "")}
+                    for p in products]
+        except (KeyError, AttributeError):
+            return []
+
+    def get_store_list(self, part_number: str, postcode: str) -> List[dict]:
+        """获取指定邮编附近的门店列表（用于验证 Store ID）"""
+        stores, _ = self.check_pickup_availability([part_number], postcode)
+        return stores
+
+    def check_availability_from_page(self, part_numbers: List[str]) -> Dict[str, dict]:
+        """
+        【备用方案】通过解析 Apple 官方购买页面 HTML 获取 SKU 状态
+        当库存 API 被区域限制（如海外 IP 返回 541）时使用。
+        只能判断发售状态（comingSoon）和配送信息，不能精确判断门店库存。
+        返回: {part_number: {available, message, coming_soon, shipping_quote, source}}
+        """
+        import re
+        results = {}
+        for pn in part_numbers:
+            results[pn] = {
+                "available": None,  # 默认未知，页面访问失败时保持未知
+                "message": "",
+                "delivery_date": "",
+                "source": "page-parse",
+                "is_coming_soon": None,
+                "shipping_quote": None,
+            }
+
+        # 根据 part number 分组，不同产品使用不同的购买页
+        # MK2 开头 = iPhone Duo, MJY 开头 = iPhone 18 Pro Max（与 Pro 共用页面）
+        product_pages = {
+            "iphone-duo": [],
+            "iphone-18-pro": [],
+        }
+        for pn in part_numbers:
+            if pn.startswith("MK2"):
+                product_pages["iphone-duo"].append(pn)
+            elif pn.startswith("MJY"):
+                product_pages["iphone-18-pro"].append(pn)
+            else:
+                product_pages["iphone-duo"].append(pn)
+
+        for product_slug, pns in product_pages.items():
+            if not pns:
+                continue
+
+            try:
+                url = f"https://www.apple.com.cn/shop/buy-iphone/{product_slug}"
+                resp = self._request_raw_with_retry(url, module="page_parse", location=product_slug)
+                if resp is None or resp.status_code != 200:
+                    status = resp.status_code if resp else "None"
+                    logger.warning("产品页面访问失败 %s: %s", product_slug, status)
+                    for pn in pns:
+                        results[pn]["available"] = None  # 未知
+                        results[pn]["message"] = "页面访问失败"
+                    continue
+
+                html = resp.text
+
+                # 解析每个 SKU 的状态对象
+                for pn in pns:
+                    # 先找所有 comingSoon 的位置，然后检查附近是否有目标 partNumber
+                    found = False
+                    obj_str = ""
+                    for cs_match in re.finditer(r'comingSoon', html):
+                        cs_pos = cs_match.start()
+                        # 向前 1500 字符内查找该 partNumber
+                        search_start = max(0, cs_pos - 1500)
+                        nearby = html[search_start:cs_pos]
+                        if f'"partNumber":"{pn}"' in nearby:
+                            # 找到包含该 partNumber 和 comingSoon 的对象
+                            # 向前找 {
+                            obj_start = html.rfind("{", 0, cs_pos)
+                            # 向后找匹配的 }
+                            depth = 0
+                            obj_end = cs_pos
+                            for i in range(obj_start, min(obj_start + 3000, len(html))):
+                                if html[i] == "{":
+                                    depth += 1
+                                elif html[i] == "}":
+                                    depth -= 1
+                                    if depth == 0:
+                                        obj_end = i + 1
+                                        break
+                            candidate = html[obj_start:obj_end]
+                            # 关键1：确认提取的对象确实包含目标 partNumber
+                            # 关键2：确认是真正的购买状态对象，不是价格配置对象
+                            # 真正的状态对象应包含 getReady / displayShippingQuote / showShipLabel 等字段
+                            has_state_fields = any(f in candidate for f in [
+                                '"getReady"', '"displayShippingQuote"', '"showShipLabel"',
+                                '"isComingSoon"', '"comingSoonText"'
+                            ])
+                            if f'"partNumber":"{pn}"' in candidate and has_state_fields:
+                                obj_str = candidate
+                                found = True
+                                break
+
+                    if not found:
+                        # 页面中只有价格列表，没有状态对象（新型号未开卖时常见）
+                        # 无法确定状态，标记为未知
+                        results[pn]["is_coming_soon"] = None
+                        results[pn]["available"] = None
+                        results[pn]["message"] = "暂无配送信息"
+                        continue
+
+                    # 提取字段
+                    def extract_field(name):
+                        m = re.search(r'"' + name + r'":([^,}]+)', obj_str)
+                        if m:
+                            val = m.group(1).strip()
+                            if val == "null":
+                                return None
+                            if val == "true":
+                                return True
+                            if val == "false":
+                                return False
+                            # 去掉引号
+                            return val.strip('"')
+                        return None
+
+                    coming_soon = extract_field("comingSoon")
+                    get_ready = extract_field("getReady")
+                    shipping_quote = extract_field("displayShippingQuote")
+                    show_ship_label = extract_field("showShipLabel")
+
+                    results[pn]["is_coming_soon"] = coming_soon
+                    results[pn]["shipping_quote"] = shipping_quote
+
+                    if coming_soon is True:
+                        results[pn]["available"] = False
+                        results[pn]["message"] = "即将发售，暂不可购买"
+                    elif coming_soon is False:
+                        # 已发售，判断是否有配送信息
+                        if shipping_quote:
+                            results[pn]["available"] = True
+                            results[pn]["message"] = shipping_quote
+                            results[pn]["delivery_date"] = shipping_quote
+                        else:
+                            # comingSoon=false 但无配送信息：暂无货/暂不可购买
+                            results[pn]["available"] = False
+                            results[pn]["message"] = "暂不可购买"
+                    else:
+                        # 对象中没有 comingSoon 字段，无法确定状态
+                        results[pn]["is_coming_soon"] = None
+                        results[pn]["available"] = None
+                        results[pn]["message"] = "状态未知"
+
+                logger.info("页面解析完成 %s，获取 %d 个 SKU 状态", product_slug, len(pns))
+
+            except Exception as e:
+                logger.error("页面解析失败 %s: %s", product_slug, e)
+                for pn in pns:
+                    if not results[pn]["message"]:
+                        results[pn]["message"] = f"解析失败: {str(e)[:30]}"
+
+        return results
+
+    def detect_api_availability(self) -> str:
+        """
+        检测当前网络环境下可用的数据源
+        返回: 'api' (库存API可用) 或 'page' (只能用页面解析)
+        """
+        try:
+            url = self.pickup_cfg.get("api_url",
+                "https://www.apple.com.cn/shop/retail/pickup-message")
+            resp = self.session.get(url,
+                params={"pl": "true", "parts.0": "MK2P4CH/A", "location": "510000"},
+                timeout=self.timeout)
+            if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                return "api"
+        except Exception:
+            pass
+        return "page"

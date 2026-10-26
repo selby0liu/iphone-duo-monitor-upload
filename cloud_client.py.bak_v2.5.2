@@ -1,0 +1,129 @@
+"""
+Cloud Client - 从云端服务器读取监控状态
+
+供 Mac App 在 Cloud 模式下使用。
+- 只读
+- Token 认证
+- 断线不显示无货，显示"数据暂不可更新"
+"""
+
+import json
+import time
+import logging
+import requests
+from threading import Thread, Lock
+
+logger = logging.getLogger(__name__)
+
+
+class CloudClient:
+    """云端状态客户端"""
+
+    def __init__(self, server_url: str = "", auth_token: str = "", poll_interval: int = 10):
+        """
+        Args:
+            server_url: 云端服务器地址，如 http://49.235.136.61:8765
+            auth_token: 认证 Token
+            poll_interval: 轮询间隔（秒）
+        """
+        self.server_url = server_url.rstrip("/")
+        self.auth_token = auth_token
+        self.poll_interval = poll_interval
+
+        self._thread = None
+        self._running = False
+        self._lock = Lock()
+        self._last_status = None
+        self._last_update = 0
+        self._last_error = ""
+        self._online = False
+
+        # 状态回调
+        self.status_callback = None
+
+    def start(self):
+        """启动后台轮询线程"""
+        if self._running:
+            return
+        if not self.server_url or not self.auth_token:
+            logger.warning("Cloud Client: server_url 或 auth_token 未配置，不启动")
+            return
+
+        self._running = True
+        self._thread = Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"Cloud Client 已启动: {self.server_url}，间隔 {self.poll_interval}s")
+
+    def stop(self):
+        """停止轮询"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        logger.info("Cloud Client 已停止")
+
+    def _poll_loop(self):
+        """后台轮询循环"""
+        while self._running:
+            try:
+                status = self._fetch_status()
+                with self._lock:
+                    self._last_status = status
+                    self._last_update = time.time()
+                    self._online = True
+                    self._last_error = ""
+
+                if self.status_callback:
+                    self.status_callback(status, True, "")
+
+            except Exception as e:
+                with self._lock:
+                    self._online = False
+                    self._last_error = str(e)
+
+                if self.status_callback:
+                    self.status_callback(self._last_status, False, str(e))
+
+                logger.warning(f"Cloud Client 请求失败: {e}")
+
+            # 等待下一次轮询
+            for _ in range(self.poll_interval * 10):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+    def _fetch_status(self) -> dict:
+        """从云端获取状态"""
+        url = f"{self.server_url}/status"
+        headers = {"Authorization": f"Bearer {self.auth_token}"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_status(self) -> dict | None:
+        """获取最近一次状态"""
+        with self._lock:
+            return self._last_status
+
+    def is_online(self) -> bool:
+        """云端是否在线"""
+        with self._lock:
+            return self._online
+
+    def get_last_update(self) -> float:
+        """获取最后更新时间戳"""
+        with self._lock:
+            return self._last_update
+
+    def get_last_error(self) -> str:
+        """获取最后错误信息"""
+        with self._lock:
+            return self._last_error
+
+    def test_connection(self) -> tuple[bool, str]:
+        """测试连接（同步）"""
+        try:
+            status = self._fetch_status()
+            return True, f"连接成功，服务运行 {status.get('monitor', {}).get('uptime_seconds', 0):.0f}s"
+        except Exception as e:
+            return False, str(e)

@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Checkout Assistant - 独立模块（只在本地 Mac 运行）
+检测到库存后，在本机浏览器打开对应 SKU 的 Apple 中国购买页，最终门店确认和付款由用户本人完成。
+
+安全边界（永久禁止）：
+- 不保存 Apple ID 密码
+- 不保存 2FA 验证码
+- 不保存 CVV/支付密码
+- 不导出 Cookie/session token
+- 不自动登录、不处理验证码
+- 不自动提交订单
+- 不自动付款
+
+打开方式：macOS `open <URL>`（系统默认浏览器）或 `open -a Safari <URL>`，
+不通过 AppleScript 控制浏览器，不依赖 TCC/Automation 权限。
+用户可提前在目标浏览器中登录 Apple ID。
+
+门店助手（auto_select_store，默认关闭）：
+- 同一个 SKU 即使多家门店同时有货，也只打开一个商品页
+- 该 SKU 本轮所有 AVAILABLE 门店按优先级矩阵排序后，整条候选列表放进 URL fragment
+  （#duomonitor-stores=R761,R793,R484）。fragment 不会发给 Apple，只供本机浏览器扩展读取
+- 由浏览器扩展在 Apple 页面自己加载出门店列表后选中最高优先级且仍可选的门店；
+  本模块不调用任何 Apple API，不加购物袋、不结账、不下单、不付款
+
+防重复规则：
+- 同一轮（wave）同一 part_number 最多打开一次，多家门店合并显示
+- 同一 part_number 冷却 cooldown_seconds（默认 600 秒）
+- 两轮打开之间的全局最小间隔 min_open_interval_seconds（默认 20 秒）
+- 一轮内最多打开 max_tabs_per_wave 个标签页（默认 2）
+- 第一次 Cloud snapshot 只建立 baseline，不打开任何页面
+"""
+
+import os
+import re
+import time
+import json
+import logging
+import subprocess
+import threading
+import webbrowser
+from datetime import datetime
+from enum import Enum
+from typing import Optional, Dict, List, Callable
+from urllib.parse import quote
+
+logger = logging.getLogger(__name__)
+
+APPLE_CN_PRODUCT_URL = "https://www.apple.com.cn/shop/product/{part_number}"
+BARK_GROUP = "iPhoneDuoMonitor"
+BARK_LEVEL = "timeSensitive"
+
+# 本地候选门店 fragment：#duomonitor-stores=R761,R793,R484
+# URL fragment 按 HTTP 规范永远不会随请求发送给服务器，只有本机浏览器扩展读得到。
+# 只允许放门店编号，绝对不放 Token / Cookie / Apple ID / 手机号 / 任何个人信息。
+STORE_FRAGMENT_KEY = "duomonitor-stores"
+STORE_NUMBER_RE = re.compile(r"^R[0-9A-Z]{2,7}$")
+MAX_CANDIDATE_STORES = 8
+
+# ----------------------------------------------------------------------
+# 取货日期标签：把 Apple 的取货文案变成给人看的短标签（今天可取 / 周六 09/19 可取）。
+# 背景：2026-09-14 10:32 天环广场"有货"其实是「星期六 2026/09/19」的取货名额，
+# 消息栏只写"有货 ✓"，看起来像能马上抢的现货。
+# 只用于显示：不参与有货/无货判定、不过滤任何事件、不进 URL。认不出就返回空串，绝不瞎猜。
+# ----------------------------------------------------------------------
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WEEKDAY_RE = re.compile(r"星期([一二三四五六日天])")
+_YMD_RE = re.compile(r"\d{4}/(\d{1,2})/(\d{1,2})")
+_MD_CN_RE = re.compile(r"(\d{1,2})月(\d{1,2})日")
+_WEEKDAY_CN = {"一": "周一", "二": "周二", "三": "周三", "四": "周四",
+               "五": "周五", "六": "周六", "日": "周日", "天": "周日"}
+_NEGATIVE_WORDS = ("暂无", "无货", "暂不提供", "不提供", "不可取")
+
+
+def _pickup_label_one(quote) -> str:
+    text = re.sub(r"\s+", " ", _HTML_TAG_RE.sub(" ", str(quote or ""))).strip()
+    if not text or any(w in text for w in _NEGATIVE_WORDS):
+        return ""
+    if "今天" in text or "今日" in text:
+        return "今天可取"
+    if "明天" in text:
+        return "明天可取"
+    m = _YMD_RE.search(text) or _MD_CN_RE.search(text)
+    if not m:
+        return ""
+    month, day = int(m.group(1)), int(m.group(2))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return ""
+    w = _WEEKDAY_RE.search(text)
+    prefix = (_WEEKDAY_CN[w.group(1)] + " ") if w else ""
+    return f"{prefix}{month:02d}/{day:02d} 可取"
+
+
+def pickup_date_label(*quotes) -> str:
+    """依次看 pickup_search_quote / store_pickup_quote，第一个认得出日期的为准"""
+    for q in quotes:
+        label = _pickup_label_one(q)
+        if label:
+            return label
+    return ""
+
+SUPPORTED_BROWSERS = ("default", "safari")
+DEFAULT_COOLDOWN_SECONDS = 600
+DEFAULT_MIN_OPEN_INTERVAL_SECONDS = 20
+DEFAULT_MAX_TABS_PER_WAVE = 2
+DEFAULT_PRIORITY_TIER1 = ["R793", "R484", "R761"]   # 深圳：前海壹方城 / 益田假日广场 / 万象城
+DEFAULT_PRIORITY_TIER2 = ["R577", "R639"]           # 广州：天环广场 / 珠江新城
+BARK_SOUND_TIER = {1: "alarm", 2: "bell"}
+DEFAULT_QUIET_HOURS = "23:00-07:00"  # 本地时间；时段内不用 critical 等级（不吵醒），留空=随时叫醒
+
+REASON_TEXT = {
+    "opened": "已打开购买页",
+    "baseline": "启动基线，未打开",
+    "cooldown": "冷却中，未重复打开",
+    "global_interval": "全局间隔未到，未打开",
+    "wave_cap": "本轮已达标签页上限，未打开",
+    "auto_open_disabled": "自动打开已关闭",
+    "open_failed": "打开浏览器失败",
+    "non_priority": "非重点门店，仅通知不开页",
+}
+
+
+class CheckoutState(Enum):
+    """Checkout Assistant 状态"""
+    IDLE = "IDLE"
+    STOCK_FOUND = "STOCK_FOUND"
+    OPENING_PRODUCT_PAGE = "OPENING_PRODUCT_PAGE"
+    CART_ADDED = "CART_ADDED"
+    CHECKOUT_STARTED = "CHECKOUT_STARTED"
+    DETAILS_FILLED = "DETAILS_FILLED"
+    WAITING_FOR_AUTH = "WAITING_FOR_AUTH"
+    WAITING_FOR_PAYMENT = "WAITING_FOR_PAYMENT"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class CheckoutAssistant:
+    """
+    结账助手 - 独立模块，不修改基础 monitor 核心逻辑。
+    默认关闭，需用户在 GUI 中手动启用；启用状态持久化到 config["checkout"]。
+    """
+
+    def __init__(self, config: dict = None,
+                 clock: Callable[[], float] = None,
+                 opener: Callable[[str, str], bool] = None,
+                 bark_config: dict = None,
+                 pusher: Callable[[dict], bool] = None):
+        self.config = config or {}
+        cfg = self.config
+        # Bark 推送（复用 config["notification"]["bark"]：{"enabled": bool, "url": "https://api.day.app/<key>"}）
+        self.bark_config = dict(bark_config or {})
+        self._pusher = pusher
+        self.last_push_error = None
+        self.enabled = bool(cfg.get("enabled", False))
+        self.auto_open_page = bool(cfg.get("auto_open_buy_page", True))
+        self.auto_add_to_cart = bool(cfg.get("auto_add_to_cart", False))
+        self.auto_fill_details = bool(cfg.get("auto_fill_details", False))
+        self.auto_start_checkout = bool(cfg.get("auto_start_checkout", False))
+        # 门店助手：在购买页 URL 后附加本地候选门店 fragment，交给本机浏览器扩展选中 radio。
+        # 默认关闭；关闭时 URL 与行为和以前完全一致（不附加 fragment）。
+        self.auto_select_store = bool(cfg.get("auto_select_store", False))
+        browser = str(cfg.get("browser", "default")).lower()
+        self.browser = browser if browser in SUPPORTED_BROWSERS else "default"
+        self.cooldown_seconds = self._as_int(cfg.get("cooldown_seconds"), DEFAULT_COOLDOWN_SECONDS)
+        self.min_open_interval_seconds = self._as_int(
+            cfg.get("min_open_interval_seconds"), DEFAULT_MIN_OPEN_INTERVAL_SECONDS)
+        self.max_tabs_per_wave = self._as_int(cfg.get("max_tabs_per_wave"), DEFAULT_MAX_TABS_PER_WAVE)
+        # 重点门店：一级（深圳）最优先，二级（广州）其次；重点门店不受冷却限制；可选只为重点门店开页
+        self.priority_tier1 = self._as_store_list(cfg.get("priority_stores_tier1"), DEFAULT_PRIORITY_TIER1)
+        self.priority_tier2 = self._as_store_list(cfg.get("priority_stores_tier2"), DEFAULT_PRIORITY_TIER2)
+        self.open_only_priority = bool(cfg.get("open_only_priority", True))
+        self.priority_bypass_cooldown = bool(cfg.get("priority_bypass_cooldown", True))
+        self.quiet_hours = self._as_quiet_hours(cfg.get("quiet_hours", DEFAULT_QUIET_HOURS))
+
+        self._clock = clock or time.time
+        self._opener = opener
+        self._last_open_by_part: Dict[str, float] = {}
+        self._last_open_global: float = 0.0
+        self.baseline_established = False
+        self.last_results: List[dict] = []
+
+        self.state = CheckoutState.IDLE
+        self.current_sku = None
+        self.current_store = None
+        self.error_message = None
+        self.last_action_time = None
+
+        # 用户资料（仅本机，不写日志，不上传）
+        self.profile_file = os.path.expanduser(
+            "~/Library/Application Support/iPhoneDuoMonitor/checkout_profile.json"
+        )
+        self._ensure_profile_security()
+
+    @staticmethod
+    def _as_store_list(value, default: list) -> list:
+        """接受列表或逗号/空格分隔字符串；空值→默认；返回大写去重的 Store ID 列表"""
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            raw = [x.strip() for x in value.replace("，", ",").replace(" ", ",").split(",")]
+        else:
+            try:
+                raw = [str(x).strip() for x in value]
+            except TypeError:
+                return list(default)
+        out = []
+        for x in raw:
+            x = x.upper()
+            if x and x not in out:
+                out.append(x)
+        return out
+
+    @staticmethod
+    def _as_quiet_hours(value) -> str:
+        """校验 "HH:MM-HH:MM"；非法或空 → ""（不静音）"""
+        text = str(value or "").strip().replace("－", "-").replace("~", "-").replace("：", ":")
+        if not text:
+            return ""
+        try:
+            a, b = text.split("-")
+            for part in (a, b):
+                h, m = part.strip().split(":")
+                if not (0 <= int(h) <= 23 and 0 <= int(m) <= 59):
+                    return ""
+            return f"{a.strip()}-{b.strip()}"
+        except ValueError:
+            return ""
+
+    def in_quiet_hours(self, now: float = None) -> bool:
+        """当前本地时间是否在静音时段内（支持跨午夜）"""
+        if not self.quiet_hours:
+            return False
+        a, b = self.quiet_hours.split("-")
+        lt = time.localtime(now if now is not None else self._clock())
+        cur = lt.tm_hour * 60 + lt.tm_min
+        ah, am = (int(x) for x in a.split(":"))
+        bh, bm = (int(x) for x in b.split(":"))
+        start, end = ah * 60 + am, bh * 60 + bm
+        if start == end:
+            return False
+        if start < end:
+            return start <= cur < end
+        return cur >= start or cur < end
+
+    def store_tier(self, store_number: str) -> int:
+        """1=一级重点，2=二级重点，0=普通"""
+        sn = str(store_number or "").strip().upper()
+        if sn in self.priority_tier1:
+            return 1
+        if sn in self.priority_tier2:
+            return 2
+        return 0
+
+    def store_rank(self, store_number: str):
+        """
+        排序键 (层级, 层级内顺序)：一级 > 二级 > 普通。
+        同一层级内按用户配置列表里的先后顺序，例如一级 = R761, R793, R484 时，
+        R761 排在 R793 前面。普通门店并列，由 Python 稳定排序保持命中顺序。
+        """
+        sn = str(store_number or "").strip().upper()
+        if sn in self.priority_tier1:
+            return (1, self.priority_tier1.index(sn))
+        if sn in self.priority_tier2:
+            return (2, self.priority_tier2.index(sn))
+        return (9, 0)
+
+    @staticmethod
+    def sanitize_store_numbers(store_numbers, limit: int = MAX_CANDIDATE_STORES) -> List[str]:
+        """
+        只保留形如 R484 / R7612 的门店编号，转大写、去重、保持传入顺序、最多 limit 个。
+        任何其它内容（空值、中文名、Token 样式的字符串）一律丢弃——fragment 里只允许门店编号。
+        """
+        out: List[str] = []
+        for raw in store_numbers or []:
+            sn = str(raw or "").strip().upper()
+            if STORE_NUMBER_RE.match(sn) and sn not in out:
+                out.append(sn)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def build_store_fragment(self, store_numbers) -> str:
+        """构造 #duomonitor-stores=R761,R793,R484；没有合法门店时返回空串"""
+        stores = self.sanitize_store_numbers(store_numbers)
+        if not stores:
+            return ""
+        return "#{}={}".format(STORE_FRAGMENT_KEY, ",".join(stores))
+
+    @staticmethod
+    def _as_int(value, default: int) -> int:
+        try:
+            v = int(value)
+            return v if v >= 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    def to_config(self) -> Dict:
+        """导出可持久化的开关配置（写入 config["checkout"]）"""
+        return {
+            "enabled": bool(self.enabled),
+            "auto_open_buy_page": bool(self.auto_open_page),
+            "auto_add_to_cart": bool(self.auto_add_to_cart),
+            "auto_fill_details": bool(self.auto_fill_details),
+            "auto_start_checkout": bool(self.auto_start_checkout),
+            "auto_select_store": bool(self.auto_select_store),
+            "browser": self.browser if self.browser in SUPPORTED_BROWSERS else "default",
+            "cooldown_seconds": int(self.cooldown_seconds),
+            "min_open_interval_seconds": int(self.min_open_interval_seconds),
+            "max_tabs_per_wave": int(self.max_tabs_per_wave),
+            "priority_stores_tier1": list(self.priority_tier1),
+            "priority_stores_tier2": list(self.priority_tier2),
+            "open_only_priority": bool(self.open_only_priority),
+            "priority_bypass_cooldown": bool(self.priority_bypass_cooldown),
+            "quiet_hours": self.quiet_hours,
+        }
+
+    # ------------------------------------------------------------------
+    # 用户资料
+    # ------------------------------------------------------------------
+
+    def _ensure_profile_security(self):
+        """确保 profile 文件权限安全（仅当前用户可读）"""
+        if os.path.exists(self.profile_file):
+            try:
+                os.chmod(self.profile_file, 0o600)
+            except Exception:
+                pass
+
+    def load_profile(self) -> Dict:
+        """加载用户资料（仅本机）"""
+        if os.path.exists(self.profile_file):
+            try:
+                with open(self.profile_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_profile(self, profile: Dict):
+        """保存用户资料（仅本机，权限600）"""
+        os.makedirs(os.path.dirname(self.profile_file), exist_ok=True)
+        # 安全检查：不允许保存敏感字段
+        sensitive_keys = ["password", "apple_id_password", "cvv", "payment_password",
+                          "2fa_code", "verification_code", "cookie", "session", "token"]
+        cleaned = {k: v for k, v in profile.items()
+                   if k.lower() not in sensitive_keys}
+        with open(self.profile_file, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+        os.chmod(self.profile_file, 0o600)
+        logger.info("用户资料已保存（已过滤敏感字段）")
+
+    def clear_profile(self):
+        """一键清除用户资料"""
+        if os.path.exists(self.profile_file):
+            os.remove(self.profile_file)
+            logger.info("用户资料已清除")
+
+    # ------------------------------------------------------------------
+    # URL / 浏览器
+    # ------------------------------------------------------------------
+
+    def get_buy_url(self, part_number: str, store_numbers=None) -> str:
+        """
+        SKU 精确购买页 URL（Apple 自动重定向到对应 product family 的购买页）。
+        只有在 auto_select_store 打开、且传入了候选门店时，才在末尾附加本地 fragment；
+        fragment 不会发给 Apple，只供本机浏览器扩展读取。默认（关闭）行为与旧版逐字节一致。
+        """
+        url = APPLE_CN_PRODUCT_URL.format(part_number=str(part_number).strip())
+        if self.auto_select_store and store_numbers:
+            url += self.build_store_fragment(store_numbers)
+        return url
+
+    def build_open_command(self, url: str) -> List[str]:
+        if self.browser == "safari":
+            return ["open", "-a", "Safari", url]
+        return ["open", url]
+
+    def _open_url(self, url: str) -> bool:
+        if self._opener is not None:
+            try:
+                return bool(self._opener(url, self.browser))
+            except Exception as e:
+                logger.warning("打开购买页失败（注入 opener）: %s", e)
+                return False
+        cmd = self.build_open_command(url)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return True
+            logger.warning("open 命令返回 %s: %s", result.returncode, (result.stderr or "").strip())
+        except Exception as e:
+            logger.warning("open 命令执行失败: %s", e)
+        try:
+            return bool(webbrowser.open(url))
+        except Exception as e:
+            logger.warning("webbrowser 回退失败: %s", e)
+            return False
+
+    # ------------------------------------------------------------------
+    # Bark 推送到手机（走 api.day.app，不涉及 Apple；失败只记日志）
+    # ------------------------------------------------------------------
+
+    def set_bark_config(self, bark_config: dict):
+        self.bark_config = dict(bark_config or {})
+
+    def bark_enabled(self) -> bool:
+        return bool(self.bark_config.get("enabled")) and bool(str(self.bark_config.get("url", "")).strip())
+
+    def bark_payload(self, result: dict) -> dict:
+        tier = int(result.get("priority") or 0)
+        prefix = f"【{result.get('priority_city') or '重点'}】" if tier else ""
+        title = f"{prefix}iPhone 有货" + ("（Mac 已打开购买页）" if result.get("opened") else "")
+        body = f"{result['product_label']}\n门店: {result['stores_label']}"
+        quiet = self.in_quiet_hours()
+        payload = {
+            "bark_url": str(self.bark_config.get("url", "")).strip().rstrip("/"),
+            "title": title,
+            "body": body,
+            "url": result["url"],
+            "group": BARK_GROUP,
+            "level": "critical" if (tier == 1 and not quiet) else BARK_LEVEL,
+        }
+        if tier in BARK_SOUND_TIER and not quiet:
+            payload["sound"] = BARK_SOUND_TIER[tier]
+        if tier == 1 and not quiet:
+            payload["volume"] = 10
+        return payload
+
+    def push_text(self, title: str, body: str, url: str = "", level: str = BARK_LEVEL) -> bool:
+        """通用 Bark 推送（例如"监控失明"告警）；Bark 未启用时返回 False。不受 enabled 开关影响。"""
+        if not self.bark_enabled():
+            return False
+        payload = {
+            "bark_url": str(self.bark_config.get("url", "")).strip().rstrip("/"),
+            "title": title, "body": body, "url": url, "group": BARK_GROUP, "level": level,
+        }
+        return self._deliver(payload)
+
+    def _deliver(self, payload: dict) -> bool:
+        if self._pusher is not None:
+            try:
+                return bool(self._pusher(payload))
+            except Exception as e:
+                self.last_push_error = str(e)
+                logger.warning("Bark 推送失败（注入 pusher）: %s", e)
+                return False
+        threading.Thread(target=self._send_bark_request, args=(payload,), daemon=True).start()
+        return True
+
+    def _push_bark(self, result: dict) -> bool:
+        if not self.bark_enabled():
+            return False
+        payload = self.bark_payload(result)
+        if self._pusher is not None:
+            try:
+                return bool(self._pusher(payload))
+            except Exception as e:
+                self.last_push_error = str(e)
+                logger.warning("Bark 推送失败（注入 pusher）: %s", e)
+                return False
+        threading.Thread(target=self._send_bark_request, args=(payload,), daemon=True).start()
+        return True
+
+    def _send_bark_request(self, payload: dict):
+        import urllib.request
+        import urllib.parse
+        endpoint = (
+            f"{payload['bark_url']}/{quote(payload['title'], safe='')}/{quote(payload['body'], safe='')}"
+            + "?" + urllib.parse.urlencode({k: v for k, v in {
+                "url": payload["url"],
+                "group": payload["group"],
+                "level": payload["level"],
+                "sound": payload.get("sound"),
+                "volume": payload.get("volume"),
+            }.items() if v not in (None, "")})
+        )
+        try:
+            with urllib.request.urlopen(endpoint, timeout=8) as resp:
+                status = resp.getcode()
+            if status == 200:
+                logger.info("Bark 已推送: %s", payload["title"])
+            else:
+                self.last_push_error = f"HTTP {status}"
+                logger.warning("Bark 推送返回 HTTP %s", status)
+        except Exception as e:
+            self.last_push_error = str(e)
+            logger.warning("Bark 推送失败: %s", e)
+
+    # ------------------------------------------------------------------
+    # 触发入口
+    # ------------------------------------------------------------------
+
+    def on_stock_found(self, sku_id: str, part_number: str, store_info: dict = None,
+                       sku_info: dict = None, initial_snapshot: bool = False) -> List[dict]:
+        """单条有货事件入口（兼容旧调用），内部走 on_stock_wave 的去重规则。"""
+        store_info = store_info or {}
+        sku_info = sku_info or {}
+        hit = {
+            "sku_id": sku_id,
+            "part_number": part_number,
+            "sku_name": sku_info.get("name", ""),
+            "capacity": sku_info.get("capacity", ""),
+            "color": sku_info.get("color", ""),
+            "store_number": store_info.get("store_number", ""),
+            "store_name": store_info.get("store_name", store_info.get("name", "")),
+            "city": store_info.get("city", ""),
+        }
+        return self.on_stock_wave([hit], initial_snapshot=initial_snapshot)
+
+    def on_stock_wave(self, hits: List[dict], initial_snapshot: bool = False) -> List[dict]:
+        """
+        一轮（wave）有货事件入口。
+        hits: [{sku_id, part_number, sku_name, capacity, color, store_number, store_name, city}, ...]
+        返回每个 part_number 一条结果：
+          {part_number, sku_id, opened, reason, url, stores, product_label, stores_label, message}
+        """
+        if not self.enabled:
+            return []
+
+        groups = self._group_hits(hits)
+        if not groups:
+            return []
+
+        now = self._clock()
+        self.last_action_time = now
+
+        if initial_snapshot:
+            self.baseline_established = True
+            results = [self._result(g, False, "baseline") for g in groups]
+            for r in results:
+                logger.info("Checkout Assistant: %s", r["message"])
+            self.last_results = results
+            return results
+
+        self.state = CheckoutState.STOCK_FOUND
+        first = groups[0]
+        self.current_sku = first["sku_id"] or first["part_number"]
+        self.current_store = {"store_name": first["stores_label"]}
+
+        if not self.auto_open_page:
+            results = [self._result(g, False, "auto_open_disabled") for g in groups]
+            for r in results:
+                r["pushed"] = self._push_bark(r)
+            self.last_results = results
+            return results
+
+        global_gap_ok = (now - self._last_open_global) >= self.min_open_interval_seconds
+        opened_this_wave = 0
+        first_opened_part = None
+        results = []
+        for g in groups:
+            pn = g["part_number"]
+            is_priority = int(g.get("priority") or 0) > 0
+            if self.open_only_priority and not is_priority:
+                results.append(self._result(g, False, "non_priority"))
+                continue
+            last_pn = self._last_open_by_part.get(pn)
+            if (last_pn is not None and (now - last_pn) < self.cooldown_seconds
+                    and not (is_priority and self.priority_bypass_cooldown)):
+                results.append(self._result(g, False, "cooldown"))
+                continue
+            if not global_gap_ok:
+                results.append(self._result(g, False, "global_interval"))
+                continue
+            if opened_this_wave >= self.max_tabs_per_wave:
+                results.append(self._result(g, False, "wave_cap"))
+                continue
+
+            self.state = CheckoutState.OPENING_PRODUCT_PAGE
+            ok = self._open_url(g["url"])
+            self.state = CheckoutState.STOCK_FOUND
+            if ok:
+                self._last_open_by_part[pn] = now
+                self._last_open_global = now
+                opened_this_wave += 1
+                if first_opened_part is None:
+                    first_opened_part = pn
+                results.append(self._result(g, True, "opened"))
+            else:
+                results.append(self._result(g, False, "open_failed"))
+
+        for r in results:
+            r["pushed"] = self._push_bark(r)
+            logger.info("Checkout Assistant: %s%s", r["message"], "｜已推送手机" if r["pushed"] else "")
+        self.last_results = results
+
+        # 实验性后续步骤（默认关闭，本次不扩展）
+        if first_opened_part and self.auto_add_to_cart:
+            self._add_to_cart(first_opened_part)
+
+        return results
+
+    def _group_hits(self, hits: List[dict]) -> List[dict]:
+        """按 part_number 合并同一轮命中，门店去重并保持出现顺序"""
+        groups: Dict[str, dict] = {}
+        order: List[str] = []
+        for h in hits or []:
+            pn = str(h.get("part_number") or "").strip()
+            if not pn:
+                continue
+            if pn not in groups:
+                groups[pn] = {
+                    "part_number": pn,
+                    "sku_id": h.get("sku_id", ""),
+                    "sku_name": h.get("sku_name", ""),
+                    "capacity": h.get("capacity", ""),
+                    "color": h.get("color", ""),
+                    "stores": [],
+                    "_store_keys": set(),
+                    "url": self.get_buy_url(pn),
+                }
+                order.append(pn)
+            g = groups[pn]
+            store_number = str(h.get("store_number") or "").strip()
+            store_name = str(h.get("store_name") or "").strip()
+            key = store_number or store_name
+            if key and key in g["_store_keys"]:
+                continue
+            if key:
+                g["_store_keys"].add(key)
+            g["stores"].append({
+                "store_number": store_number,
+                "store_name": store_name,
+                "city": h.get("city", ""),
+                # 只用于显示，例如"周六 09/19 可取"；不参与排序、判定和 URL
+                "pickup_label": str(h.get("pickup_label") or "").strip(),
+            })
+
+        out = []
+        for pn in order:
+            g = groups[pn]
+            del g["_store_keys"]
+            # 门店按优先级排序（一级 > 二级 > 普通；同级按配置列表顺序），组的优先级 = 最高门店优先级
+            for st in g["stores"]:
+                st["tier"] = self.store_tier(st.get("store_number"))
+            g["stores"].sort(key=lambda st: self.store_rank(st.get("store_number")))
+            top = g["stores"][0] if g["stores"] else {"tier": 0}
+            g["priority"] = top.get("tier", 0) if top.get("tier") else 0
+            g["priority_city"] = (top.get("city") or "") if g["priority"] else ""
+            g["product_label"] = self._product_label(g)
+            g["stores_label"] = self._stores_label(g["stores"])
+            # 本轮这个 SKU 的候选门店：来自真实 AVAILABLE 命中，按上面的优先级顺序，绝不凭空添加门店
+            g["candidate_stores"] = self.sanitize_store_numbers(
+                [st.get("store_number") for st in g["stores"]])
+            g["candidate_label"] = " → ".join(g["candidate_stores"])
+            # 同一个 SKU 只有这一个 URL、只开一个标签页，整条候选列表放进 fragment
+            g["url"] = self.get_buy_url(pn, g["candidate_stores"])
+            out.append(g)
+        out.sort(key=lambda g: (g["priority"] if g["priority"] else 9))
+        return out
+
+    @staticmethod
+    def _product_label(g: dict) -> str:
+        name = g.get("sku_name") or " ".join(x for x in (g.get("capacity"), g.get("color")) if x) or g.get("sku_id") or ""
+        parts = [name.strip()] if name.strip() else []
+        parts.append(f"SKU {g['part_number']}")
+        if g.get("capacity"):
+            parts.append(str(g["capacity"]))
+        if g.get("color"):
+            parts.append(str(g["color"]))
+        return " / ".join(parts)
+
+    @staticmethod
+    def _stores_label(stores: List[dict]) -> str:
+        labels = []
+        for s in stores:
+            name = s.get("store_name") or ""
+            num = s.get("store_number") or ""
+            pickup = s.get("pickup_label") or ""
+            if name and num:
+                text = f"{name}({num})"
+            elif num:
+                text = num
+            elif name:
+                text = name
+            else:
+                continue
+            labels.append(text + (f" {pickup}" if pickup else ""))
+        return ", ".join(labels) if labels else "-"
+
+    def _result(self, g: dict, opened: bool, reason: str) -> dict:
+        text = REASON_TEXT.get(reason, reason)
+        tier = int(g.get("priority") or 0)
+        prefix = f"【{g.get('priority_city') or '重点'}】" if tier else ""
+        candidates = list(g.get("candidate_stores") or [])
+        message = f"{prefix}{text}：{g['product_label']}｜门店: {g['stores_label']}"
+        if opened and self.auto_select_store and candidates:
+            message += f"｜候选门店顺序: {g.get('candidate_label') or ''}（扩展将选中当前仍可取货的最高优先门店）"
+        return {
+            "part_number": g["part_number"],
+            "sku_id": g.get("sku_id", ""),
+            "opened": opened,
+            "pushed": False,
+            "reason": reason,
+            "url": g["url"],
+            "stores": list(g["stores"]),
+            "candidate_stores": candidates,
+            "candidate_label": g.get("candidate_label", ""),
+            "priority": tier,
+            "priority_city": g.get("priority_city", ""),
+            "product_label": g["product_label"],
+            "stores_label": g["stores_label"],
+            "message": message,
+        }
+
+    # ------------------------------------------------------------------
+    # 实验性后续步骤（默认关闭，本次未改动逻辑）
+    # ------------------------------------------------------------------
+
+    def _add_to_cart(self, part_number: str) -> bool:
+        """
+        尝试自动加入购物袋。
+        通过 AppleScript 控制 Safari 点击按钮。
+        失败时不报错，留给用户手动操作。
+        """
+        if not self.auto_add_to_cart:
+            return False
+
+        try:
+            # 等待页面加载
+            time.sleep(3)
+
+            # 尝试点击"加入购物袋"按钮
+            # Apple 页面结构可能变化，失败时安全退出
+            script = '''
+            tell application "Safari"
+                tell document 1
+                    do JavaScript "
+                        var buttons = document.querySelectorAll('[data-test=\"add-to-cart\"], button[type=\"submit\"]');
+                        for (var i = 0; i < buttons.length; i++) {
+                            if (buttons[i].textContent.includes('加入购物袋') || buttons[i].textContent.includes('Add to Bag')) {
+                                buttons[i].click();
+                                return 'clicked';
+                            }
+                        }
+                        return 'not_found';
+                    "
+                end tell
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=10)
+            if "clicked" in result.stdout:
+                self.state = CheckoutState.CART_ADDED
+                logger.info("已自动加入购物袋")
+                # 如果启用自动结账，继续
+                if self.auto_start_checkout:
+                    time.sleep(2)
+                    self._start_checkout()
+                return True
+            else:
+                logger.warning("未找到加入购物袋按钮，页面结构可能已变化")
+                self.state = CheckoutState.STOCK_FOUND
+                return False
+        except Exception as e:
+            logger.warning("自动加入购物袋失败: %s", e)
+            self.state = CheckoutState.STOCK_FOUND
+            return False
+
+    def _start_checkout(self):
+        """开始结账流程"""
+        if not self.auto_start_checkout:
+            return
+
+        try:
+            self.state = CheckoutState.CHECKOUT_STARTED
+            # 点击结账按钮
+            script = '''
+            tell application "Safari"
+                tell document 1
+                    do JavaScript "
+                        var buttons = document.querySelectorAll('button, a');
+                        for (var i = 0; i < buttons.length; i++) {
+                            if (buttons[i].textContent.includes('结账') || buttons[i].textContent.includes('Check Out')) {
+                                buttons[i].click();
+                                return 'checkout_started';
+                            }
+                        }
+                        return 'not_found';
+                    "
+                end tell
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=10)
+            if "checkout_started" in result.stdout:
+                logger.info("已开始结账流程")
+                # 检查是否需要登录
+                time.sleep(3)
+                self._check_auth_required()
+            else:
+                logger.warning("未找到结账按钮")
+        except Exception as e:
+            logger.warning("开始结账失败: %s", e)
+            self.state = CheckoutState.FAILED
+            self.error_message = str(e)
+
+    def _check_auth_required(self):
+        """检查是否需要身份验证（登录/2FA/CAPTCHA）"""
+        try:
+            script = '''
+            tell application "Safari"
+                tell document 1
+                    do JavaScript "
+                        var body = document.body.innerText;
+                        if (body.includes('登录') || body.includes('Sign In') ||
+                            body.includes('验证') || body.includes('Verify') ||
+                            body.includes('CAPTCHA') || body.includes('captcha')) {
+                            return 'auth_required';
+                        }
+                        return 'ok';
+                    "
+                end tell
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=10)
+            if "auth_required" in result.stdout:
+                self.state = CheckoutState.WAITING_FOR_AUTH
+                logger.warning("检测到需要身份验证，暂停自动化，等待用户处理")
+                return True
+            else:
+                # 可以继续填写地址
+                if self.auto_fill_details:
+                    self._fill_details()
+                return False
+        except Exception as e:
+            logger.warning("检查验证状态失败: %s", e)
+            return False
+
+    def _fill_details(self):
+        """填写收货/取货信息（仅使用用户已保存的资料）"""
+        if not self.auto_fill_details:
+            return
+
+        profile = self.load_profile()
+        if not profile:
+            logger.info("未配置用户资料，跳过自动填写")
+            self.state = CheckoutState.WAITING_FOR_PAYMENT
+            return
+
+        try:
+            # 填写姓名、电话、地址等
+            # 注意：不填写任何支付相关信息
+            self.state = CheckoutState.DETAILS_FILLED
+            logger.info("已填写收货信息（不包含支付信息）")
+            # 填写完成后，进入等待付款状态
+            self.state = CheckoutState.WAITING_FOR_PAYMENT
+            logger.info("已推进到付款前，等待用户本人完成付款")
+        except Exception as e:
+            logger.warning("填写信息失败: %s", e)
+            self.state = CheckoutState.WAITING_FOR_PAYMENT
+
+    # ------------------------------------------------------------------
+    # 状态
+    # ------------------------------------------------------------------
+
+    def get_state_info(self) -> Dict:
+        """获取当前状态信息（用于 GUI 显示）"""
+        return {
+            "state": self.state.value,
+            "enabled": self.enabled,
+            "browser": self.browser,
+            "current_sku": self.current_sku,
+            "current_store": self.current_store.get("store_name") if self.current_store else None,
+            "error": self.error_message,
+            "last_action": datetime.fromtimestamp(self.last_action_time).strftime("%H:%M:%S") if self.last_action_time else None,
+        }
+
+    def reset(self):
+        """重置状态（不清除冷却记录）"""
+        self.state = CheckoutState.IDLE
+        self.current_sku = None
+        self.current_store = None
+        self.error_message = None
+        logger.info("Checkout Assistant 状态已重置")
+
+    def cancel(self):
+        """取消当前结账流程"""
+        self.state = CheckoutState.CANCELLED
+        logger.info("Checkout Assistant 已取消")

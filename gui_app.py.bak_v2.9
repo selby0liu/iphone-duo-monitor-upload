@@ -1,0 +1,3054 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+iPhone Duo 库存监控 - macOS GUI 应用
+基于 PySide6，不重写底层监控逻辑，直接复用 monitor/state/api 模块
+"""
+
+import os
+import sys
+import time
+import json
+import platform
+import subprocess
+import logging
+from datetime import datetime, timedelta
+from collections import deque
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
+    QGroupBox, QCheckBox, QSpinBox, QLineEdit, QTextEdit, QTabWidget,
+    QStatusBar, QMessageBox, QSystemTrayIcon, QMenu, QStyle,
+    QComboBox, QFileDialog, QSplitter, QListWidget, QListWidgetItem
+)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
+from PySide6.QtGui import QFont, QColor, QIcon, QAction, QDesktopServices, QPixmap, QPainter
+
+# 路径处理：支持开发模式和 PyInstaller 打包模式
+if getattr(sys, 'frozen', False):
+    APP_DIR = sys._MEIPASS
+    CONFIG_DIR = APP_DIR
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    CONFIG_DIR = APP_DIR
+
+# v1.4.0: 日志和用户数据始终使用 ~/Library/Application Support/iPhoneDuoMonitor/
+DATA_DIR = os.path.expanduser("~/Library/Application Support/iPhoneDuoMonitor")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(os.path.join(DATA_DIR, "state"), exist_ok=True)
+os.makedirs(os.path.join(DATA_DIR, "logs"), exist_ok=True)
+
+BASE_DIR = APP_DIR
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from monitor import IPhoneDuoMonitor
+from config_loader import load_config, get_enabled_skus, get_all_store_numbers, get_store_map
+from checkout_assistant import CheckoutAssistant, CheckoutState, pickup_date_label
+import launch_checklist
+
+APP_VERSION = "2.8.0"
+DEVELOPER_NAME = "柳景盛开发"
+
+
+class APIHistory:
+    """API 请求历史统计（内存中，不记录敏感信息）"""
+    def __init__(self, max_size=500):
+        self.records = deque(maxlen=max_size)
+        self.current_session_id = 0
+
+    def record(self, endpoint, http_status, latency, success, network_session_id=0):
+        self.records.append({
+            "timestamp": time.time(),
+            "endpoint": endpoint,
+            "http_status": http_status,
+            "latency": latency,
+            "success": success,
+            "network_session_id": network_session_id
+        })
+
+    def get_stats(self, hours=1):
+        """获取最近N小时的全局统计"""
+        cutoff = time.time() - hours * 3600
+        recent = [r for r in self.records if r["timestamp"] > cutoff]
+        return self._calc_stats(recent)
+
+    def get_current_session_stats(self, hours=1):
+        """获取当前网络会话的统计（v1.3.0）"""
+        cutoff = time.time() - hours * 3600
+        recent = [r for r in self.records
+                  if r["timestamp"] > cutoff and r.get("network_session_id") == self.current_session_id]
+        return self._calc_stats(recent)
+
+    def _calc_stats(self, records):
+        if not records:
+            return {"total": 0, "success": 0, "rate_200": 0, "rate_541": 0, "avg_latency": 0}
+        total = len(records)
+        success = sum(1 for r in records if r["success"])
+        count_200 = sum(1 for r in records if r["http_status"] == 200)
+        count_541 = sum(1 for r in records if r["http_status"] == 541)
+        avg_latency = sum(r["latency"] for r in records) / total
+        return {
+            "total": total,
+            "success": success,
+            "rate_200": count_200 / total * 100,
+            "rate_541": count_541 / total * 100,
+            "avg_latency": avg_latency
+        }
+
+
+class MonitorWorker(QObject):
+    """监控工作线程，运行在 QThread 中"""
+    status_update = Signal(dict)
+    log_message = Signal(str)
+    alert_signal = Signal(list)
+    api_record = Signal(str, int, float, bool, int)  # endpoint, http_status, latency, success, network_session_id
+
+    def __init__(self, config_dir=None):
+        super().__init__()
+        self.config_dir = config_dir or BASE_DIR
+        self.monitor = None
+        self.running = False
+        self.interval = 5
+        self.test_mode = False
+
+    def start(self):
+        try:
+            config_dir = self.config_dir
+            if getattr(sys, 'frozen', False):
+                import shutil
+                user_config_dir = os.path.join(DATA_DIR, "config")
+                os.makedirs(user_config_dir, exist_ok=True)
+                for fname in ["config.json", "skus.json", "stores.json"]:
+                    src = os.path.join(APP_DIR, fname)
+                    dst = os.path.join(user_config_dir, fname)
+                    if os.path.exists(src) and not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+                config_dir = user_config_dir
+
+            self.monitor = IPhoneDuoMonitor(config_dir, register_signals=False)
+            self.interval = self.monitor.interval
+
+            # v1.5.0: 初始化 Pickup Diagnostics（完全旁路，不影响主 Monitor）
+            from pickup_diagnostics import PickupDiagnostics
+            self.diagnostics = PickupDiagnostics()
+            self.diagnostics.start()
+
+            # 初始化新模块（独立于主 Monitor，__init__不联网）
+            from china_control_monitor import ChinaControlMonitor
+            from australia_monitor import AustraliaControlMonitor
+            from market_watch import MarketWatch
+            from product_locator_monitor import ProductLocatorMonitor
+            self.china_control = ChinaControlMonitor(
+                config={"enabled": True, "interval_seconds": 300},
+                stores=self.monitor.stores)
+            self.australia_control = AustraliaControlMonitor(
+                config={"enabled": True, "interval_seconds": 300})
+            self.market_watch = MarketWatch(config={"enabled": False})
+            self.product_locator = ProductLocatorMonitor(
+                config={"enabled": True, "interval_seconds": 300})
+
+            # 新模块错峰启动（v1.3.1 修复：避免启动时瞬间并发触发限流）
+            now = time.time()
+            for pc in self.china_control.postcodes:
+                self.china_control.next_check[pc] = now + 30  # 30秒后再开始
+            self.australia_control.next_check = now + 60  # 60秒后再开始
+            self.product_locator.next_check = now + 90  # 90秒后再开始
+
+            # v1.5.1: 网络会话追踪统一由 diagnostics 管理
+            self._last_diag_network_check = 0
+
+            self.running = True
+            self.log_message.emit(f"监控启动 v{APP_VERSION} | SKU: {len(self.monitor.enabled_skus)} 个 | 门店: {len(self.monitor.target_store_numbers)} 家 | 区域轮询: {self.monitor.pickup_region_interval}秒 错峰: {self.monitor.pickup_stagger_seconds}秒")
+
+            while self.running:
+                try:
+                    start = time.time()
+                    alerts = self.monitor.run_once()
+                    duration = time.time() - start
+
+                    # v1.5.0: 记录 App Pickup 审计日志
+                    try:
+                        pickup_status = "200" if self.monitor.pickup_api_available else "541"
+                        self.diagnostics.log_app_pickup_request(
+                            status=pickup_status,
+                            latency=duration,
+                        )
+                    except Exception:
+                        pass
+
+                    # v1.5.1: diagnostics 网络变化检测（每30秒一次，带缓存）
+                    now = time.time()
+                    if now - self._last_diag_network_check > 30:
+                        self._last_diag_network_check = now
+                        try:
+                            network_change = self.diagnostics.check_network_change()
+                            if network_change:
+                                self.log_message.emit(
+                                    f"网络切换: {network_change['old_ip']} -> {network_change['new_ip']}, "
+                                    f"新 session={network_change['new_session']}")
+                                self.monitor.reset_all_backoff()
+                                self.monitor.clear_api_session()
+                                # 新模块错峰恢复
+                                now_t = time.time()
+                                for pc in self.china_control.postcodes:
+                                    self.china_control.next_check[pc] = now_t + 10
+                                self.australia_control.next_check = now_t + 20
+                                self.product_locator.next_check = now_t + 30
+                        except Exception:
+                            pass
+
+                    # 新模块独立检查（失败不影响主 Monitor）
+                    try:
+                        self.china_control.check_once()
+                    except Exception as e:
+                        self.log_message.emit(f"China Control 异常（不影响主监控）: {e}")
+                    try:
+                        self.australia_control.check_once()
+                    except Exception as e:
+                        self.log_message.emit(f"Australia Control 异常（不影响主监控）: {e}")
+                    try:
+                        self.product_locator.check()
+                    except Exception as e:
+                        self.log_message.emit(f"Product Locator 异常（不影响主监控）: {e}")
+
+                    # 记录 API 统计（带网络会话ID，v1.5.1 从 diagnostics 获取）
+                    pickup_ok = self.monitor.pickup_api_available
+                    try:
+                        session_id = int(self.diagnostics.get_current_session().get("session_id", "0"), 16) % 10000
+                    except Exception:
+                        session_id = 0
+                    self.api_record.emit("pickup", 200 if pickup_ok else 541, duration, pickup_ok, session_id)
+
+                    if alerts:
+                        self.alert_signal.emit(alerts)
+
+                    status_data = self._collect_status()
+                    self.status_update.emit(status_data)
+
+                except Exception as e:
+                    self.log_message.emit(f"监控异常: {e}")
+
+                for _ in range(int(self.interval * 10)):
+                    if not self.running:
+                        break
+                    time.sleep(0.1)
+
+        except Exception as e:
+            self.log_message.emit(f"监控启动失败: {e}")
+
+    def stop(self):
+        self.running = False
+        if self.monitor:
+            self.monitor.running = False
+        # v1.5.0: 停止 diagnostics
+        if hasattr(self, 'diagnostics') and self.diagnostics:
+            try:
+                self.diagnostics.stop()
+            except Exception:
+                pass
+
+    def _collect_status(self) -> dict:
+        m = self.monitor
+        if not m:
+            return {}
+
+        pickup_status = {}
+        for store_number in m.target_store_numbers:
+            store_info = m.store_map.get(store_number, {})
+            pickup_status[store_number] = {
+                "name": store_info.get("name", store_number),
+                "city": store_info.get("city", ""),
+                "skus": {}
+            }
+            for sku in m.enabled_skus:
+                state = m.state.get_pickup_state(sku["id"], store_number)
+                pickup_status[store_number]["skus"][sku["id"]] = {
+                    "available": state.get("available"),
+                    "last_checked": state.get("last_checked"),
+                    "last_known": state.get("available"),  # 最后已知状态
+                    "detail": state.get("detail", {})
+                }
+
+        delivery_status = {}
+        for sku in m.enabled_skus:
+            state = m.state.get_delivery_state(sku["id"])
+            delivery_status[sku["id"]] = {
+                "available": state.get("available"),
+                "last_checked": state.get("last_checked"),
+                "detail": state.get("detail", {})
+            }
+
+        meta = m.state.get_meta()
+
+        # 新模块状态（独立于主 Monitor）
+        china_control_status = {}
+        australia_status = {}
+        market_status = {}
+        product_locator_status = {}
+        if hasattr(self, 'china_control'):
+            china_control_status = self.china_control.get_status()
+        if hasattr(self, 'australia_control'):
+            australia_status = self.australia_control.get_status()
+        if hasattr(self, 'market_watch'):
+            market_status = self.market_watch.get_status()
+        if hasattr(self, 'product_locator'):
+            product_locator_status = {
+                "http_status": self.product_locator.http_status,
+                "last_success": self.product_locator.last_success,
+                "last_error": self.product_locator.last_error,
+                "products_count": len(self.product_locator.products),
+                "consecutive_failures": self.product_locator.consecutive_failures,
+                "backoff_seconds": self.product_locator.backoff_seconds,
+                "sku_status": {pn: pl.get("exists", False) for pn, pl in self.product_locator.products.items()},
+            }
+
+        return {
+            "pickup_api_available": m.pickup_api_available,
+            "pickup_status": pickup_status,
+            "delivery_status": delivery_status,
+            "meta": meta,
+            "enabled_skus": [{"id": s["id"], "name": s["name"], "part_number": s["part_number"],
+                              "capacity": s["capacity"], "color": s["color"]} for s in m.enabled_skus],
+            "interval": self.interval,
+            "pickup_region_interval": getattr(m, 'pickup_region_interval', 30),
+            "pickup_stagger": getattr(m, 'pickup_stagger_seconds', 10),
+            "pickup_backoff": getattr(m, 'pickup_backoff', {}),
+            "pickup_next_check": getattr(m, 'pickup_next_check', {}),
+            "test_mode": self.test_mode,
+            "china_control": china_control_status,
+            "australia_control": australia_status,
+            "market_watch": market_status,
+            "product_locator": product_locator_status,
+            # v1.5.1: 从 diagnostics 获取网络信息
+            "public_ip": getattr(self.diagnostics, 'get_current_session', lambda: {})().get('public_ip') if hasattr(self, 'diagnostics') else None,
+            "network_session_id": getattr(self.diagnostics, 'get_current_session', lambda: {})().get('session_id', '0') if hasattr(self, 'diagnostics') else '0',
+        }
+
+    def update_interval(self, seconds):
+        self.interval = seconds
+        if self.monitor:
+            self.monitor.interval = seconds
+
+    def trigger_test_alert(self):
+        """触发测试报警（Test Mode）"""
+        test_alerts = [{
+            "type": "pickup",
+            "sku_id": "duo_512_starlight",
+            "store_number": "R359",
+            "detail": {
+                "store_name": "南京东路",
+                "city": "上海",
+                "address": "上海市黄浦区南京东路300号",
+                "product_title": "iPhone Duo 512GB 星光白色",
+                "pickup_search_quote": "今天可取货",
+                "store_pickup_quote": "今天可取货",
+            },
+            "timestamp": time.time(),
+        }]
+        self.alert_signal.emit(test_alerts)
+        self.log_message.emit("[TEST MODE] 模拟报警: 512GB 星光白 @ 上海南京东路 有货")
+
+
+class MainWindow(QMainWindow):
+    # Cloud 状态信号（用于后台线程回调转到主线程）
+    cloud_status_received = Signal(dict, bool, str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"iPhone Duo 库存监控 v{APP_VERSION}")
+        self.setMinimumSize(1200, 800)
+
+        self.monitor_thread = None
+        self.monitor_worker = None
+        self.current_status = {}
+        self.api_history = APIHistory()
+        self.consecutive_success = 0
+        self.consecutive_failure = 0
+        self.last_success_time = None
+        self.last_error_time = None
+        self.last_error_msg = ""
+        self.test_mode = False
+        self._check_count = 0
+        self._current_msg_filter = "all"
+        self._message_history = []
+
+        if getattr(sys, 'frozen', False):
+            self.config_dir = os.path.join(DATA_DIR, "config")
+            os.makedirs(self.config_dir, exist_ok=True)
+            import shutil
+            # skus.json 和 stores.json 是程序数据，总是更新到最新版
+            for fname in ["skus.json", "stores.json"]:
+                src = os.path.join(APP_DIR, fname)
+                dst = os.path.join(self.config_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+            # config.json 是用户配置，只在不存在时复制
+            for fname in ["config.json"]:
+                src = os.path.join(APP_DIR, fname)
+                dst = os.path.join(self.config_dir, fname)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+        else:
+            self.config_dir = BASE_DIR
+
+        self.config, self.all_skus, self.stores = load_config(self.config_dir)
+        self.store_map = get_store_map(self.stores)
+        self.checkout = CheckoutAssistant(
+            self.config.get("checkout", {}),
+            bark_config=self.config.get("notification", {}).get("bark", {}),
+        )
+
+        # 开售前检查清单：人工确认项 + 首发模式开关（纯本地，不联网，不读浏览器数据）
+        lc = self.config.get("launch_check", {}) or {}
+        self._launch_manual = launch_checklist.normalize_manual(lc.get("manual"))
+        self._launch_mode = bool(lc.get("launch_mode", False))
+        self._cloud_online = False
+        self._cloud_healthy = False
+        self._pickup_ok = False
+        self._pickup_ok_age = None
+
+        # v2.0: Cloud 模式
+        self.cloud_client = None
+        self.cloud_mode = self.config.get("cloud", {}).get("enabled", True)
+        self._cloud_last_inventory = {}  # 用于检测库存变化，触发本地通知
+
+        # 消息通知栏持久化
+        self._message_history_file = os.path.join(DATA_DIR, "message_history.json")
+        self._load_message_history()
+
+        # Cloud 状态信号连接（后台线程→主线程）
+        self.cloud_status_received.connect(self._on_cloud_status_update)
+
+        self._setup_ui()
+        self._setup_tray()
+
+        # 服务器指示灯心跳：每秒一次，纯本地显示，不产生网络请求
+        self._hb_phase = False
+        self._led_heartbeat = QTimer(self)
+        self._led_heartbeat.setInterval(1000)
+        self._led_heartbeat.timeout.connect(self._led_heartbeat_tick)
+        self._led_heartbeat.start()
+        self._update_armed_label()
+
+        # v2.0: 根据模式启动
+        if self.cloud_mode:
+            QTimer.singleShot(500, self._start_cloud_mode)
+        else:
+            QTimer.singleShot(500, self.start_monitoring)
+
+    def _create_status_card(self, title, value, color="#95a5a6"):
+        """创建小型状态卡片"""
+        card = QWidget()
+        card.setStyleSheet(f"""
+            QWidget {{
+                background-color: #f5f6f7;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }}
+        """)
+        layout = QVBoxLayout(card)
+        layout.setSpacing(2)
+        layout.setContentsMargins(8, 6, 8, 6)
+
+        title_label = QLabel(title)
+        title_label.setFont(QFont("Menlo", 9))
+        title_label.setStyleSheet("color: #888;")
+        layout.addWidget(title_label)
+
+        value_label = QLabel(value)
+        value_label.setFont(QFont("Menlo", 12, QFont.Bold))
+        value_label.setStyleSheet(f"color: {color};")
+        value_label.setProperty("card_value", True)
+        layout.addWidget(value_label)
+
+        card.value_label = value_label
+        return card
+
+    def _update_card(self, card, value, color):
+        """更新状态卡片的值和颜色"""
+        if hasattr(card, 'value_label'):
+            card.value_label.setText(value)
+            card.value_label.setStyleSheet(f"color: {color};")
+
+    # ------------------------------------------------------------------
+    # 主/备服务器卡片 + "是否在向 Apple 发请求"指示灯（纯本地显示，不产生任何网络请求）
+    # ------------------------------------------------------------------
+    LED_COLORS = {  # (心跳暗, 心跳亮, 请求事件高亮)
+        "green": ("#1e8449", "#2ecc71", "#7dffb0"),
+        "yellow": ("#b7950b", "#f4d03f", "#fff176"),
+        "red": ("#922b21", "#e74c3c", "#ff8a80"),
+        "grey": ("#bdc3c7", "#bdc3c7", "#bdc3c7"),
+        "purple": ("#8e44ad", "#a569bd", "#e040fb"),  # 请求事件闪光
+    }
+    LED_FLASH_MS = 1500
+    REGION_NAMES = {"510000": "广东", "200000": "南京", "210000": "上海"}
+    IDLE_SECONDS = 240  # 正常最多 180 秒一次请求；超过 4 分钟没请求视为"无请求"
+    NEW_REQUEST_MIN_ADVANCE = 30  # 上次请求时间戳前进超过 30 秒才算新请求（服务器状态缓存有 ~5 秒抖动）
+    OFFLINE_GRACE_SECONDS = 25  # 单次拉取失败后的宽限期，超过才显示离线
+
+    def _create_server_card(self, title):
+        card = self._create_status_card(title, "检测中...", "#95a5a6")
+        layout = card.layout()
+        header = layout.itemAt(0).widget()
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(0, 0, 0, 0)
+        layout.removeWidget(header)
+        row.addWidget(header)
+        led = QLabel()
+        led.setFixedSize(12, 12)
+        led.setToolTip("每次向 Apple 发出请求时闪紫色；心跳：绿=在线正常，黄=限流/无请求/重连中，红=连不上，灰=未配置")
+        row.addWidget(led)
+        row.addStretch()
+        layout.insertLayout(0, row)
+        detail = QLabel("-")
+        detail.setFont(QFont("Menlo", 9))
+        detail.setStyleSheet("color: #888;")
+        layout.addWidget(detail)
+        card.led = led
+        card.detail_label = detail
+        card._steady_color = "grey"
+        card._led_key = title
+        self._set_led(card, "grey", False)
+        return card
+
+    def _set_led(self, card, color_key, level=None):
+        """level: None/False=按心跳相位取暗/亮，2=请求事件高亮"""
+        colors = self.LED_COLORS.get(color_key, self.LED_COLORS["grey"])
+        if not level:
+            level = 1 if getattr(self, "_hb_phase", False) else 0
+        card.led.setStyleSheet(f"background-color: {colors[level]}; border-radius: 6px;")
+
+    def _is_flashing(self, card):
+        t = self._led_timers.get(card._led_key)
+        return t is not None and t.isActive()
+
+    def _flash_led(self, card, color_key):
+        """请求事件：高亮 LED_FLASH_MS 后回到心跳"""
+        old = self._led_timers.get(card._led_key)
+        if old is not None:
+            old.stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda c=card: self._set_led(c, c._steady_color))
+        self._led_timers[card._led_key] = timer
+        self._set_led(card, color_key, 2)
+        timer.start(self.LED_FLASH_MS)
+
+    def _led_heartbeat_tick(self):
+        """每秒一次：常亮色在暗/亮之间跳动（灰色不变）；闪光进行中的灯不覆盖"""
+        self._hb_phase = not getattr(self, "_hb_phase", False)
+        for card in (getattr(self, "primary_card", None), getattr(self, "backup_card", None)):
+            if card is None or self._is_flashing(card):
+                continue
+            self._set_led(card, card._steady_color)
+
+    def _update_server_cards(self, status_data, online):
+        """根据 /status（单源或合并后的多源）更新主/备卡片与指示灯；顺带生成技术行文字"""
+        now = time.time()
+        sources = []
+        if online and status_data:
+            sources = status_data.get("cloud_sources") or []
+            if not sources:
+                from cloud_client import source_summary
+                urls = getattr(self, "_cloud_active_urls", ("", ""))
+                sources = [source_summary("主", urls[0] if urls else "", status_data, "", True)]
+        by_label = {s.get("label"): s for s in sources}
+        urls = getattr(self, "_cloud_active_urls", None)
+        backup_configured = bool(urls[1]) if urls else bool(
+            hasattr(self, "cloud_backup_url_edit") and self.cloud_backup_url_edit.text().strip())
+        tech_parts = []
+
+        for label, card in (("主", self.primary_card), ("备", self.backup_card)):
+            src = by_label.get(label)
+            if label == "备" and src is None and not backup_configured:
+                card._steady_color = "grey"
+                self._set_led(card, "grey", False)
+                self._update_card(card, "未配置", "#95a5a6")
+                card.detail_label.setText("设置页填写备用服务器地址后启用")
+                continue
+            track = self._server_track.setdefault(label, {"req_ts": {}, "last_ok": None})
+            if src is None or not src.get("online"):
+                err = (src or {}).get("error", "") or ("Cloud 离线" if not online else "")
+                last_ok = track.get("last_ok")
+                if last_ok and now - last_ok < self.OFFLINE_GRACE_SECONDS:
+                    # 单次拉取失败（Tailscale 偶发超时）：短暂宽限，显示重连中而不是立刻报离线
+                    card._steady_color = "yellow"
+                    self._set_led(card, "yellow")
+                    self._update_card(card, "重连中", "#f39c12")
+                    card.detail_label.setText(f"{int(now - last_ok)}s前正常 · {err[:30]}".strip())
+                    tech_parts.append(f"{label} 重连中")
+                    continue
+                card._steady_color = "red"
+                self._set_led(card, "red")
+                self._update_card(card, "离线", "#e74c3c")
+                card.detail_label.setText(f"Mac 连不上 {err[:36]}".strip())
+                tech_parts.append(f"{label} 离线")
+                continue
+
+            track["last_ok"] = now
+            new_request = False
+            newest_ago, newest_region = None, None
+            for rk, ago in (src.get("last_request_per_region") or {}).items():
+                ts = now - ago
+                prev = track["req_ts"].get(rk)
+                # 服务器 /status 每 5 秒刷新一次缓存，ago 有几秒抖动；真实新请求会让时间戳前进 ≥ 区域间隔
+                if prev is not None and ts > prev + self.NEW_REQUEST_MIN_ADVANCE:
+                    new_request = True
+                track["req_ts"][rk] = max(prev or 0, ts)
+                if newest_ago is None or ago < newest_ago:
+                    newest_ago, newest_region = ago, rk.replace("pickup_", "")
+            api_ok = bool(src.get("api_available"))
+            idle = newest_ago is None or newest_ago > self.IDLE_SECONDS
+
+            if api_ok and not idle:
+                card._steady_color = "green"
+                self._update_card(card, "在线·正常", "#27ae60")
+            elif idle:
+                card._steady_color = "yellow"
+                self._update_card(card, "在线·无请求", "#f39c12")
+            else:
+                card._steady_color = "yellow"
+                self._update_card(card, "在线·限流", "#f39c12")
+
+            region_name = self.REGION_NAMES.get(newest_region, newest_region or "-")
+            if newest_ago is None:
+                req_text = "尚无请求"
+            elif idle:
+                req_text = f"无请求 {int(newest_ago // 60)} 分钟"
+            else:
+                req_text = f"最近请求 {int(newest_ago)}s前 {region_name} {'✓' if api_ok else '✗'}"
+            req60 = src.get("requests_last_60s")
+            cc = src.get("check_count")
+            card.detail_label.setText(
+                f"{req_text} | 60秒内 {req60 if req60 is not None else '-'} 次 | 累计 {cc if cc is not None else '-'}")
+
+            if new_request:
+                self._flash_led(card, "purple")  # 发出请求：紫色闪光；成功/失败看文字 ✓/✗ 和心跳颜色
+            else:
+                self._set_led(card, card._steady_color, False)
+
+            nk = src.get("newest_known_checked")
+            tech_parts.append(f"{label} 最近成功: {int(now - nk)}s前" if nk else f"{label} 最近成功: -")
+
+        self._server_tech_text = " | ".join(tech_parts)
+
+        # 整体健康：至少一台在线且 Pickup 正常 → 绿；有在线但都不正常 → 黄；全部连不上 → 红
+        any_online = any(s.get("online") for s in sources)
+        any_healthy = any(s.get("online") and s.get("api_available") for s in sources)
+
+        # 喂给开售前检查清单（只是把已经拿到的状态记下来，不额外请求任何东西）
+        self._cloud_online = any_online
+        self._cloud_healthy = any_healthy
+        self._pickup_ok = any(s.get("api_available") for s in sources)
+        ok_ts = [s.get("newest_known_checked") for s in sources if s.get("newest_known_checked")]
+        self._pickup_ok_age = (now - max(ok_ts)) if ok_ts else None
+        self._update_launch_checklist()
+        overall = "green" if any_healthy else ("yellow" if any_online else "red")
+        self._set_tray_state(overall, f"主服务器: {self.primary_card.value_label.text()} · "
+                                      f"备用服务器: {self.backup_card.value_label.text()}")
+        self._check_blindness(any_healthy, now)
+
+    # ------------------------------------------------------------------
+    # 菜单栏图标颜色 / 监控失明告警 / 武装状态 / 手动打开 / Cloud 模式防睡眠
+    # ------------------------------------------------------------------
+    TRAY_COLORS = {"green": "#2ecc71", "yellow": "#f1c40f", "red": "#e74c3c", "grey": "#95a5a6"}
+    BLIND_ALERT_SECONDS = 120      # 两台都不正常持续超过 2 分钟才告警
+    BLIND_REALERT_SECONDS = 600    # 持续失明每 10 分钟再提醒一次
+
+    def _set_tray_state(self, color_key, tooltip=""):
+        if not hasattr(self, "tray_icon"):
+            return
+        if getattr(self, "_tray_color", None) != color_key:
+            pm = QPixmap(22, 22)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(self.TRAY_COLORS.get(color_key, self.TRAY_COLORS["grey"])))
+            p.drawEllipse(3, 3, 16, 16)
+            p.end()
+            self.tray_icon.setIcon(QIcon(pm))
+            self._tray_color = color_key
+        if tooltip:
+            self.tray_icon.setToolTip(f"iPhone Duo 库存监控 · {tooltip}")
+            if hasattr(self, "tray_status_action"):
+                self.tray_status_action.setText({"green": "监控正常", "yellow": "监控受限（限流）", "red": "监控失明"}.get(color_key, "状态未知"))
+
+    def _check_blindness(self, any_healthy, now):
+        """两台服务器都不正常超过阈值：本地通知（不同音效）+ Bark 推手机；恢复时通知一次"""
+        if any_healthy:
+            if getattr(self, "_blind_alerted", False):
+                mins = int((now - self._blind_since) // 60)
+                self._send_macos_notification("监控已恢复", f"失明约 {mins} 分钟后恢复，至少一台服务器 Pickup 正常")
+                self.checkout.push_text("监控已恢复", f"失明约 {mins} 分钟后恢复", level="active")
+                self._append_log(f"[监控] 已恢复（失明约 {mins} 分钟）")
+            self._blind_since = None
+            self._blind_alerted = False
+            self._blind_last_alert = 0
+            return
+        if getattr(self, "_blind_since", None) is None:
+            self._blind_since = now
+            return
+        blind_for = now - self._blind_since
+        last = getattr(self, "_blind_last_alert", 0)
+        if blind_for >= self.BLIND_ALERT_SECONDS and (now - last) >= self.BLIND_REALERT_SECONDS:
+            mins = int(blind_for // 60)
+            body = f"主/备服务器均不正常已 {mins} 分钟，期间不会有任何有货通知"
+            self._send_macos_notification("监控失明", body, sound="Basso")
+            self.checkout.push_text("监控失明", body)
+            self._append_log(f"[监控] 失明告警：{body}")
+            self._blind_alerted = True
+            self._blind_last_alert = now
+
+    # ------------------------------------------------------------------
+    # 开售前检查清单（纯本地显示；不联网、不读浏览器数据、不阻断 Pickup 监控）
+    # ------------------------------------------------------------------
+
+    def _build_launch_checklist(self):
+        group = QGroupBox("开售前检查清单")
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(10, 6, 10, 8)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        self.launch_banner = QLabel("")
+        self.launch_banner.setFont(QFont("Menlo", 11, QFont.Bold))
+        top.addWidget(self.launch_banner)
+        top.addStretch()
+        self.launch_mode_cb = QCheckBox("首发模式")
+        self.launch_mode_cb.setToolTip("开启后，人工确认项没勾全会用红色显眼提示；不会阻断监控，也不改变 Checkout 行为")
+        self.launch_mode_cb.setChecked(self._launch_mode)
+        self.launch_mode_cb.stateChanged.connect(self._on_launch_mode_changed)
+        top.addWidget(self.launch_mode_cb)
+        outer.addLayout(top)
+
+        self.launch_warning = QLabel(launch_checklist.SAFARI_RESTART_WARNING)
+        self.launch_warning.setWordWrap(True)
+        self.launch_warning.setStyleSheet("color: #e67e22; font-weight: bold;")
+        outer.addWidget(self.launch_warning)
+
+        self.launch_rows_layout = QVBoxLayout()
+        self.launch_rows_layout.setSpacing(2)
+        outer.addLayout(self.launch_rows_layout)
+        self._launch_rows = {}          # key -> {"widget", "label", "check"}
+        self._launch_row_order = []
+        return group
+
+    def _launch_state(self):
+        """喂给 launch_checklist 的全是本机已有的信息，不为自检发任何请求"""
+        caff = getattr(self, "_cloud_caffeinate", None)
+        return {
+            "cloud_online": self._cloud_online,
+            "cloud_healthy": self._cloud_healthy,
+            "pickup_ok": self._pickup_ok,
+            "pickup_ok_age": self._pickup_ok_age,
+            "checkout_enabled": self.checkout.enabled,
+            "auto_open_buy_page": self.checkout.auto_open_page,
+            "auto_select_store": self.checkout.auto_select_store,
+            "browser": self.checkout.browser,
+            "prevent_sleep": bool(caff is not None and caff.poll() is None),
+            "sound_enabled": bool(self.config.get("notification", {}).get("sound", True)),
+            "bark_enabled": self.checkout.bark_enabled(),
+            "manual": self._launch_manual,
+            "launch_mode": self._launch_mode,
+            "chrome_ext_dir": os.path.join(BASE_DIR, "browser_extension", "apple_store_selector"),
+        }
+
+    def _launch_row(self, key, manual):
+        row = self._launch_rows.get(key)
+        if row:
+            return row
+        widget = QWidget()
+        box = QHBoxLayout(widget)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+        check = None
+        if manual:
+            check = QCheckBox("")
+            check.setToolTip("这一项程序无法诚实检测，必须你自己确认后勾选")
+            check.stateChanged.connect(lambda _s, k=key: self._on_manual_confirm_changed(k))
+            box.addWidget(check)
+        label = QLabel("")
+        label.setFont(QFont("Menlo", 10))
+        label.setWordWrap(True)
+        box.addWidget(label, 1)
+        self.launch_rows_layout.addWidget(widget)
+        row = {"widget": widget, "label": label, "check": check}
+        self._launch_rows[key] = row
+        self._launch_row_order.append(key)
+        return row
+
+    def _update_launch_checklist(self):
+        if not hasattr(self, "launch_banner"):
+            return
+        state = self._launch_state()
+        items = launch_checklist.build_checklist(state)
+        seen = set()
+        for index, item in enumerate(items):
+            key = item["key"]
+            seen.add(key)
+            row = self._launch_row(key, item["manual"])
+            # 行是按需创建的；切换浏览器后要重新排序，保证清单永远按固定顺序自上而下读
+            self.launch_rows_layout.removeWidget(row["widget"])
+            self.launch_rows_layout.insertWidget(index, row["widget"])
+            row["widget"].setVisible(True)
+            if row["check"] is not None:
+                confirmed = item["status"] in ("manual_ok", "manual_stale")
+                if row["check"].isChecked() != confirmed:
+                    row["check"].blockSignals(True)
+                    row["check"].setChecked(confirmed)
+                    row["check"].blockSignals(False)
+            icon = launch_checklist.STATUS_ICON.get(item["status"], "·")
+            color = launch_checklist.STATUS_COLOR.get(item["status"], "#7f8c8d")
+            tail = item["detail"] or ""
+            if item["manual"] and item["hint"]:
+                tail = (tail + "  " if tail else "") + item["hint"]
+            row["label"].setText(f"{icon} {item['label']}" + (f"   {tail}" if tail else ""))
+            row["label"].setStyleSheet(f"color: {color};")
+        # 切换浏览器后，另一套的人工确认行直接隐藏（两套助手都保留，只是不显示不相干的行）
+        for key in self._launch_row_order:
+            if key not in seen:
+                self._launch_rows[key]["widget"].setVisible(False)
+
+        text, color, _ready = launch_checklist.banner_text(state)
+        self.launch_banner.setText(text)
+        self.launch_banner.setStyleSheet(f"color: {color};")
+        is_safari = launch_checklist.target_browser(self.checkout.browser) == "safari"
+        self.launch_warning.setVisible(is_safari)
+
+    def _on_manual_confirm_changed(self, key):
+        row = self._launch_rows.get(key)
+        if not row or row["check"] is None:
+            return
+        checked = row["check"].isChecked()
+        self._launch_manual[key] = {"confirmed": checked, "at": time.time() if checked else 0.0}
+        self._persist_launch_check()
+        self._update_launch_checklist()
+        self._append_log(f"[自检] {'已确认' if checked else '取消确认'}：{key}")
+
+    def _on_launch_mode_changed(self, _state=None):
+        self._launch_mode = self.launch_mode_cb.isChecked()
+        self._persist_launch_check()
+        self._update_launch_checklist()
+        self._append_log(f"[自检] 首发模式 {'开启' if self._launch_mode else '关闭'}（仅影响提示，不影响监控）")
+
+    def _persist_launch_check(self):
+        config_path = os.path.join(self.config_dir, "config.json")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            config["launch_check"] = {"manual": self._launch_manual, "launch_mode": self._launch_mode}
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            self.config["launch_check"] = config["launch_check"]
+        except Exception as e:
+            self._append_log(f"[自检] 保存确认状态失败: {e}")
+
+    def _update_armed_label(self):
+        self._update_launch_checklist()
+        if not hasattr(self, "armed_label"):
+            return
+        c = self.checkout
+        problems = []
+        if not c.enabled:
+            problems.append("Checkout 未启用")
+        elif not c.auto_open_page:
+            problems.append("自动打开已关")
+        if not c.bark_enabled():
+            problems.append("Bark 未启用")
+        text = (f"武装状态 · Checkout {'已启用' if c.enabled else '未启用'} · Bark {'已启用' if c.bark_enabled() else '未启用'} · "
+                f"门店助手 {'开' if c.auto_select_store else '关'} · "
+                f"打开方式 {'Safari' if c.browser == 'safari' else '默认浏览器'} · 冷却 {c.cooldown_seconds}s · 每轮最多 {c.max_tabs_per_wave} 页 · "
+                f"重点 {'/'.join(c.priority_tier1) or '-'} › {'/'.join(c.priority_tier2) or '-'} · 静音 {c.quiet_hours or '无'}")
+        if problems:
+            text += "   ⚠ " + "，".join(problems)
+            self.armed_label.setStyleSheet("color: #e74c3c;")
+        else:
+            self.armed_label.setStyleSheet("color: #27ae60;")
+        self.armed_label.setText(text)
+
+    def _open_buy_page_manual(self, sku):
+        part = sku.get("part_number", "")
+        url = self.checkout.get_buy_url(part)
+        ok = self.checkout._open_url(url)
+        self._append_log(f"[手动] {'已打开' if ok else '打开失败'} {sku.get('name', part)} → {url}")
+
+    def _start_cloud_caffeinate(self):
+        if not self.config.get("power", {}).get("prevent_sleep", True):
+            return
+        if getattr(self, "_cloud_caffeinate", None) is not None:
+            return
+        try:
+            # -w <pid>：App 进程退出（包括被强杀）时 caffeinate 自动退出，不留孤儿进程
+            self._cloud_caffeinate = subprocess.Popen(["caffeinate", "-dimsu", "-w", str(os.getpid())],
+                                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._append_log("已启动 caffeinate：Cloud 模式下防止系统睡眠（屏幕可关闭）")
+        except Exception as e:
+            self._cloud_caffeinate = None
+            self._append_log(f"caffeinate 启动失败: {e}")
+
+    def _stop_cloud_caffeinate(self):
+        proc = getattr(self, "_cloud_caffeinate", None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        self._cloud_caffeinate = None
+
+    def _on_sku_filter_changed(self, sku_id):
+        """SKU 显示筛选变化时，更新表格列显示"""
+        if not hasattr(self, 'store_table') or not hasattr(self, 'all_skus'):
+            return
+        # 使用预计算的列索引映射
+        if not hasattr(self, '_sku_col_map'):
+            return
+        for sid, col_idx in self._sku_col_map.items():
+            cb = self.sku_checkboxes.get(sid)
+            if cb:
+                self.store_table.setColumnHidden(col_idx, not cb.isChecked())
+
+    def _set_msg_filter(self, filter_type):
+        """设置消息筛选"""
+        for btn in [self.msg_filter_all, self.msg_filter_pickup, self.msg_filter_delivery, self.msg_filter_available]:
+            btn.setChecked(False)
+        if filter_type == "all":
+            self.msg_filter_all.setChecked(True)
+        elif filter_type == "pickup":
+            self.msg_filter_pickup.setChecked(True)
+        elif filter_type == "delivery":
+            self.msg_filter_delivery.setChecked(True)
+        elif filter_type == "available":
+            self.msg_filter_available.setChecked(True)
+        self._current_msg_filter = filter_type
+        self._refresh_message_list()
+
+    def _load_message_history(self):
+        """从文件加载消息历史"""
+        try:
+            if os.path.exists(self._message_history_file):
+                with open(self._message_history_file, "r", encoding="utf-8") as f:
+                    self._message_history = json.load(f)
+        except Exception:
+            self._message_history = []
+
+    def _save_message_history(self):
+        """保存消息历史到文件"""
+        try:
+            os.makedirs(os.path.dirname(self._message_history_file), exist_ok=True)
+            with open(self._message_history_file, "w", encoding="utf-8") as f:
+                json.dump(self._message_history[-200:], f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _add_inventory_message(self, time_str, product, location, inv_type, status, is_available=False):
+        """添加库存事件消息"""
+        if not hasattr(self, '_message_history'):
+            self._message_history = []
+        msg = {
+            "time": time_str,
+            "product": product,
+            "location": location,
+            "type": inv_type,  # pickup / delivery
+            "status": status,
+            "available": is_available
+        }
+        self._message_history.append(msg)
+        # 保留最近200条
+        if len(self._message_history) > 200:
+            self._message_history = self._message_history[-200:]
+        self._save_message_history()
+        self._refresh_message_list()
+
+    def _refresh_message_list(self):
+        """刷新消息列表显示"""
+        if not hasattr(self, 'message_list') or not hasattr(self, '_message_history'):
+            return
+        self.message_list.clear()
+        msg_filter = getattr(self, '_current_msg_filter', 'all')
+        for msg in reversed(self._message_history):
+            if msg_filter == "pickup" and msg["type"] != "pickup":
+                continue
+            if msg_filter == "delivery" and msg["type"] != "delivery":
+                continue
+            if msg_filter == "available" and not msg["available"]:
+                continue
+            type_label = "门店现货" if msg["type"] == "pickup" else "邮寄库存"
+            text = f"{msg['time']}  {msg['product']}  {msg['location']}  {type_label}  {msg['status']}"
+            item = QListWidgetItem(text)
+            if msg["available"]:
+                item.setForeground(QColor("#27ae60"))
+                item.setFont(QFont("Menlo", 10, QFont.Bold))
+            elif "无货" in msg["status"] or "不可" in msg["status"]:
+                item.setForeground(QColor("#7f8c8d"))
+            else:
+                item.setForeground(QColor("#f39c12"))
+            self.message_list.addItem(item)
+
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+
+        # ===== 顶部：状态概览卡片 =====
+        health_container = QWidget()
+        health_layout = QHBoxLayout(health_container)
+        health_layout.setSpacing(8)
+        health_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Cloud 状态卡片
+        # 主/备服务器卡片（带"是否在向 Apple 发请求"指示灯）；cloud_card 指向主卡片以兼容旧调用
+        self.primary_card = self._create_server_card("主服务器")
+        self.cloud_card = self.primary_card
+        health_layout.addWidget(self.primary_card)
+        self.backup_card = self._create_server_card("备用服务器")
+        health_layout.addWidget(self.backup_card)
+        self._server_track = {}
+        self._led_timers = {}
+
+        # Pickup 状态卡片
+        self.pickup_card = self._create_status_card("门店库存", "检测中...", "#95a5a6")
+        health_layout.addWidget(self.pickup_card)
+
+        # 供货趋势状态卡片（替代原官网配送）
+        self.trend_card = self._create_status_card("供货趋势", "检测中...", "#95a5a6")
+        health_layout.addWidget(self.trend_card)
+
+        # 最后更新卡片
+        self.last_update_card = self._create_status_card("最后更新", "-", "#95a5a6")
+        health_layout.addWidget(self.last_update_card)
+
+        # 成功率卡片
+        self.success_rate_card = self._create_status_card("1小时成功率", "-", "#95a5a6")
+        health_layout.addWidget(self.success_rate_card)
+
+        health_layout.addStretch()
+
+        # 开发者署名（低调）
+        self.developer_label = QLabel(DEVELOPER_NAME)
+        self.developer_label.setFont(QFont("Menlo", 9))
+        self.developer_label.setStyleSheet("color: #999;")
+        self.developer_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        health_layout.addWidget(self.developer_label)
+
+        main_layout.addWidget(health_container)
+
+        # 次级技术信息行（小号文字）
+        self.tech_info_label = QLabel("IP: - | ISP: - | HTTP: - | 累计检查: 0 | 连续成功: 0 | 连续失败: 0")
+        self.tech_info_label.setFont(QFont("Menlo", 9))
+        self.tech_info_label.setStyleSheet("color: #888;")
+        self.tech_info_label.setAlignment(Qt.AlignLeft)
+        main_layout.addWidget(self.tech_info_label)
+
+        # 武装状态：Checkout / Bark / 打开方式 / 冷却，一眼看到有没有开
+        self.armed_label = QLabel("")
+        self.armed_label.setFont(QFont("Menlo", 9, QFont.Bold))
+        self.armed_label.setAlignment(Qt.AlignLeft)
+        main_layout.addWidget(self.armed_label)
+
+        main_layout.addWidget(self._build_launch_checklist())
+
+        # Test Mode 横幅
+        self.test_mode_banner = QLabel("⚠️ TEST MODE - 模拟数据，不写入真实库存状态")
+        self.test_mode_banner.setStyleSheet("background-color: #e74c3c; color: white; padding: 5px; font-weight: bold;")
+        self.test_mode_banner.setAlignment(Qt.AlignCenter)
+        self.test_mode_banner.setVisible(False)
+        main_layout.addWidget(self.test_mode_banner)
+
+        # ===== 标签页 =====
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # --- 库存看板 ---
+        inventory_widget = QWidget()
+        inventory_layout = QVBoxLayout(inventory_widget)
+        inventory_layout.setSpacing(10)
+
+        # 看板显示筛选 + 一键打开购买页（两行，紧凑；后端持续监控全部型号）
+        sku_filter_group = QGroupBox("看板显示 / 打开购买页（后端持续监控全部型号，此处只控制显示）")
+        sku_filter_v = QVBoxLayout(sku_filter_group)
+        sku_filter_v.setSpacing(4)
+        sku_filter_v.setContentsMargins(8, 4, 8, 4)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+        show_lbl = QLabel("显示:")
+        show_lbl.setFont(QFont("Menlo", 10, QFont.Bold))
+        row1.addWidget(show_lbl)
+        self.sku_checkboxes = {}
+        for sku in self.all_skus:
+            grp = sku.get("group", "duo")
+            if grp in ("duo", "iphone18promax"):
+                cb = QCheckBox(f"{'Duo' if grp == 'duo' else '18PM'} {sku['capacity']} {sku['color']}")
+                cb.setChecked(True)
+            else:
+                cb = QCheckBox(f"对照 {sku['capacity']} {sku['color']}")
+                cb.setChecked(False)  # 对照组默认不显示
+                cb.setStyleSheet("color: #95a5a6;")
+            cb.stateChanged.connect(lambda _=None, sid=sku["id"]: self._on_sku_filter_changed(sid))
+            self.sku_checkboxes[sku["id"]] = cb
+            row1.addWidget(cb)
+        row1.addStretch()
+        sku_filter_v.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        open_lbl = QLabel("打开购买页:")
+        open_lbl.setFont(QFont("Menlo", 10, QFont.Bold))
+        open_lbl.setToolTip("手动打开对应型号的 Apple 购买页；与自动打开使用同一 URL 和浏览器设置；不发任何 Apple API 请求")
+        row2.addWidget(open_lbl)
+        self.open_buy_buttons = {}
+        for sku in self.all_skus:
+            grp = sku.get("group", "duo")
+            if grp in ("duo", "iphone18promax"):
+                btn = QPushButton(f"{'Duo' if grp == 'duo' else '18PM'} {sku['capacity']} {sku['color']}")
+                btn.setFixedHeight(22)
+                btn.setToolTip(f"{sku.get('part_number', '')} → {self.checkout.get_buy_url(sku.get('part_number', ''))}")
+                btn.clicked.connect(lambda _=False, s=sku: self._open_buy_page_manual(s))
+                self.open_buy_buttons[sku["id"]] = btn
+                row2.addWidget(btn)
+        row2.addStretch()
+        sku_filter_v.addLayout(row2)
+        inventory_layout.addWidget(sku_filter_group)
+
+        # 门店库存表
+        table_group = QGroupBox("门店库存 — 广东 / 上海 / 南京")
+        table_layout = QVBoxLayout(table_group)
+        self.store_table = QTableWidget()
+        self._setup_store_table()
+        table_layout.addWidget(self.store_table)
+        inventory_layout.addWidget(table_group)
+
+        # 供货趋势（替代原官网配送）
+        trend_group = QGroupBox("供货趋势")
+        trend_layout = QVBoxLayout(trend_group)
+
+        # 第一行：概览指标
+        trend_overview_layout = QHBoxLayout()
+        self.trend_labels = {}
+        trend_items = [
+            ("current_stores", "当前现货", "-"),
+            ("restock_1h", "近1h补货", "-"),
+            ("restock_6h", "近6h补货", "-"),
+            ("restock_24h", "近24h补货", "-"),
+            ("last_restock", "最近补货", "-"),
+            ("active_city", "最活跃城市", "-"),
+        ]
+        for key, title, default in trend_items:
+            vbox = QVBoxLayout()
+            title_lbl = QLabel(title)
+            title_lbl.setFont(QFont("Menlo", 9))
+            title_lbl.setStyleSheet("color: #888;")
+            title_lbl.setAlignment(Qt.AlignCenter)
+            val_lbl = QLabel(default)
+            val_lbl.setFont(QFont("Menlo", 12, QFont.Bold))
+            val_lbl.setAlignment(Qt.AlignCenter)
+            self.trend_labels[key] = val_lbl
+            vbox.addWidget(title_lbl)
+            vbox.addWidget(val_lbl)
+            trend_overview_layout.addLayout(vbox)
+        trend_overview_layout.addStretch()
+        trend_layout.addLayout(trend_overview_layout)
+
+        # 第二行：补货脉冲 + 最近事件
+        trend_bottom_layout = QHBoxLayout()
+
+        # 补货脉冲
+        pulse_group = QGroupBox("补货脉冲（最近30分钟）")
+        pulse_layout = QVBoxLayout(pulse_group)
+        self.trend_pulse_label = QLabel("暂无数据")
+        self.trend_pulse_label.setFont(QFont("Menlo", 10))
+        self.trend_pulse_label.setWordWrap(True)
+        pulse_layout.addWidget(self.trend_pulse_label)
+        trend_bottom_layout.addWidget(pulse_group, stretch=1)
+
+        # 最近补货事件
+        events_group = QGroupBox("最近补货事件")
+        events_layout = QVBoxLayout(events_group)
+        self.trend_events_label = QLabel("暂无数据")
+        self.trend_events_label.setFont(QFont("Menlo", 9))
+        self.trend_events_label.setWordWrap(True)
+        events_layout.addWidget(self.trend_events_label)
+        trend_bottom_layout.addWidget(events_group, stretch=1)
+
+        trend_layout.addLayout(trend_bottom_layout)
+        trend_group.setMaximumHeight(210)
+        inventory_layout.addWidget(trend_group)
+
+        # 消息通知栏
+        msg_group = QGroupBox("消息通知")
+        msg_layout = QVBoxLayout(msg_group)
+
+        msg_filter_layout = QHBoxLayout()
+        self.msg_filter_all = QPushButton("全部")
+        self.msg_filter_pickup = QPushButton("门店现货")
+        self.msg_filter_delivery = QPushButton("邮寄库存")
+        self.msg_filter_available = QPushButton("只看有货")
+        for btn in [self.msg_filter_all, self.msg_filter_pickup, self.msg_filter_delivery, self.msg_filter_available]:
+            btn.setCheckable(True)
+            btn.setFixedHeight(24)
+            btn.setFont(QFont("Menlo", 9))
+        self.msg_filter_all.setChecked(True)
+        self.msg_filter_all.clicked.connect(lambda: self._set_msg_filter("all"))
+        self.msg_filter_pickup.clicked.connect(lambda: self._set_msg_filter("pickup"))
+        self.msg_filter_delivery.clicked.connect(lambda: self._set_msg_filter("delivery"))
+        self.msg_filter_available.clicked.connect(lambda: self._set_msg_filter("available"))
+        msg_filter_layout.addWidget(self.msg_filter_all)
+        msg_filter_layout.addWidget(self.msg_filter_pickup)
+        msg_filter_layout.addWidget(self.msg_filter_delivery)
+        msg_filter_layout.addWidget(self.msg_filter_available)
+        msg_filter_layout.addStretch()
+        msg_layout.addLayout(msg_filter_layout)
+
+        self.message_list = QListWidget()
+        self.message_list.setFont(QFont("Menlo", 10))
+        self.message_list.setMaximumHeight(160)
+        self.message_list.setAlternatingRowColors(True)
+        msg_layout.addWidget(self.message_list)
+        inventory_layout.addWidget(msg_group)
+
+        inventory_layout.addStretch()
+        from PySide6.QtWidgets import QScrollArea, QFrame
+        inventory_scroll = QScrollArea()
+        inventory_scroll.setWidgetResizable(True)
+        inventory_scroll.setFrameShape(QFrame.NoFrame)
+        inventory_scroll.setWidget(inventory_widget)
+        self.tabs.addTab(inventory_scroll, "库存看板")
+
+        # --- API 统计 ---
+        stats_widget = QWidget()
+        stats_layout = QVBoxLayout(stats_widget)
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        self.stats_text.setFont(QFont("Menlo", 10))
+        stats_layout.addWidget(self.stats_text)
+        self.tabs.addTab(stats_widget, "API 统计")
+
+        # --- 日志 ---
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+
+        log_btn_layout = QHBoxLayout()
+        open_log_btn = QPushButton("打开日志目录")
+        open_log_btn.clicked.connect(self._open_log_dir)
+        export_btn = QPushButton("导出诊断报告")
+        export_btn.clicked.connect(self._export_diagnostic_report)
+        log_btn_layout.addWidget(open_log_btn)
+        log_btn_layout.addWidget(export_btn)
+        log_btn_layout.addStretch()
+        log_layout.addLayout(log_btn_layout)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Menlo", 10))
+        log_layout.addWidget(self.log_text)
+        self.tabs.addTab(log_widget, "日志")
+
+        # --- 设置 ---
+        settings_widget = QWidget()
+        settings_layout = QVBoxLayout(settings_widget)
+
+        interval_group = QGroupBox("轮询设置")
+        interval_layout = QHBoxLayout(interval_group)
+        interval_layout.addWidget(QLabel("地区错峰间隔（秒）:"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(3, 300)
+        self.interval_spin.setValue(self.config.get("monitor", {}).get("interval_seconds", 5))
+        self.interval_spin.valueChanged.connect(self._on_interval_changed)
+        interval_layout.addWidget(self.interval_spin)
+        interval_layout.addStretch()
+        settings_layout.addWidget(interval_group)
+
+        notify_group = QGroupBox("通知设置")
+        notify_layout = QVBoxLayout(notify_group)
+        self.macos_notify_cb = QCheckBox("macOS 系统通知")
+        self.macos_notify_cb.setChecked(self.config.get("notification", {}).get("macos_notification", True))
+        notify_layout.addWidget(self.macos_notify_cb)
+        self.sound_cb = QCheckBox("播放提示音")
+        self.sound_cb.setChecked(self.config.get("notification", {}).get("sound", True))
+        notify_layout.addWidget(self.sound_cb)
+        self.auto_open_cb = QCheckBox("有货时自动打开购买页面")
+        self.auto_open_cb.setChecked(self.config.get("notification", {}).get("auto_open_buy_page", False))
+        notify_layout.addWidget(self.auto_open_cb)
+
+        bark_layout = QHBoxLayout()
+        bark_layout.addWidget(QLabel("Bark Key:"))
+        self.bark_key_edit = QLineEdit()
+        bark_url = self.config.get("notification", {}).get("bark", {}).get("url", "")
+        self.bark_key_edit.setPlaceholderText("https://api.day.app/你的Key")
+        self.bark_key_edit.setText(bark_url)
+        self.bark_key_edit.setEchoMode(QLineEdit.Password)
+        bark_layout.addWidget(self.bark_key_edit)
+        self.bark_toggle_btn = QPushButton("显示")
+        self.bark_toggle_btn.setCheckable(True)
+        self.bark_toggle_btn.setFixedWidth(60)
+        self.bark_toggle_btn.toggled.connect(self._toggle_bark_visibility)
+        bark_layout.addWidget(self.bark_toggle_btn)
+        notify_layout.addLayout(bark_layout)
+        self.bark_enabled_cb = QCheckBox("启用 Bark 推送")
+        self.bark_enabled_cb.setChecked(self.config.get("notification", {}).get("bark", {}).get("enabled", False))
+        notify_layout.addWidget(self.bark_enabled_cb)
+        settings_layout.addWidget(notify_group)
+
+        # Cloud 模式设置（v2.0）
+        cloud_group = QGroupBox("Cloud 模式（从云端服务器读取状态）")
+        cloud_layout = QVBoxLayout(cloud_group)
+        self.cloud_enabled_cb = QCheckBox("启用 Cloud 模式（默认推荐，本地 Monitor 关闭）")
+        self.cloud_enabled_cb.setChecked(self.config.get("cloud", {}).get("enabled", True))
+        cloud_layout.addWidget(self.cloud_enabled_cb)
+
+        cloud_url_layout = QHBoxLayout()
+        cloud_url_layout.addWidget(QLabel("服务器地址:"))
+        self.cloud_url_edit = QLineEdit()
+        self.cloud_url_edit.setPlaceholderText("http://49.235.136.61:8765")
+        self.cloud_url_edit.setText(self.config.get("cloud", {}).get("server_url", ""))
+        cloud_url_layout.addWidget(self.cloud_url_edit)
+        cloud_layout.addLayout(cloud_url_layout)
+
+        cloud_backup_layout = QHBoxLayout()
+        cloud_backup_layout.addWidget(QLabel("备用服务器:"))
+        self.cloud_backup_url_edit = QLineEdit()
+        self.cloud_backup_url_edit.setPlaceholderText("可选，如 http://100.70.21.76:8765（两台同时轮询、库存合并）")
+        self.cloud_backup_url_edit.setText(self.config.get("cloud", {}).get("backup_server_url", ""))
+        cloud_backup_layout.addWidget(self.cloud_backup_url_edit)
+        cloud_layout.addLayout(cloud_backup_layout)
+
+        cloud_token_layout = QHBoxLayout()
+        cloud_token_layout.addWidget(QLabel("API Token:"))
+        self.cloud_token_edit = QLineEdit()
+        self.cloud_token_edit.setPlaceholderText("云端 API 认证 Token")
+        self.cloud_token_edit.setText(self.config.get("cloud", {}).get("auth_token", ""))
+        self.cloud_token_edit.setEchoMode(QLineEdit.Password)
+        cloud_token_layout.addWidget(self.cloud_token_edit)
+        self.cloud_token_toggle_btn = QPushButton("显示")
+        self.cloud_token_toggle_btn.setCheckable(True)
+        self.cloud_token_toggle_btn.setFixedWidth(60)
+        self.cloud_token_toggle_btn.toggled.connect(self._toggle_cloud_token_visibility)
+        cloud_token_layout.addWidget(self.cloud_token_toggle_btn)
+        cloud_layout.addLayout(cloud_token_layout)
+
+        self.cloud_test_btn = QPushButton("测试 Cloud 连接")
+        self.cloud_test_btn.clicked.connect(self._test_cloud_connection)
+        cloud_layout.addWidget(self.cloud_test_btn)
+
+        self.cloud_status_label = QLabel("Cloud 状态: 未连接")
+        self.cloud_status_label.setStyleSheet("color: #95a5a6;")
+        cloud_layout.addWidget(self.cloud_status_label)
+
+        settings_layout.addWidget(cloud_group)
+
+        # 手动测试按钮
+        test_group = QGroupBox("手动测试（不改变真实库存状态）")
+        test_layout = QHBoxLayout(test_group)
+        self.test_pickup_btn = QPushButton("测试 Pickup API")
+        self.test_pickup_btn.clicked.connect(self._test_pickup_api)
+        self.test_delivery_btn = QPushButton("测试 Delivery")
+        self.test_delivery_btn.clicked.connect(self._test_delivery_api)
+        self.test_notify_btn = QPushButton("测试 macOS 通知")
+        self.test_notify_btn.clicked.connect(self._test_macos_notification)
+        self.test_sound_btn = QPushButton("测试声音")
+        self.test_sound_btn.clicked.connect(self._test_sound)
+        self.test_bark_btn = QPushButton("测试 Bark")
+        self.test_bark_btn.clicked.connect(self._test_bark)
+        for btn in [self.test_pickup_btn, self.test_delivery_btn, self.test_notify_btn,
+                    self.test_sound_btn, self.test_bark_btn]:
+            test_layout.addWidget(btn)
+        settings_layout.addWidget(test_group)
+
+        # Developer / Test Mode
+        dev_group = QGroupBox("Developer / Test Mode")
+        dev_layout = QVBoxLayout(dev_group)
+        self.test_mode_cb = QCheckBox("启用 Test Mode（模拟有货报警，不写入真实库存）")
+        self.test_mode_cb.stateChanged.connect(self._toggle_test_mode)
+        dev_layout.addWidget(self.test_mode_cb)
+        self.trigger_test_btn = QPushButton("触发模拟报警（512GB 星光白 @ 上海南京东路）")
+        self.trigger_test_btn.clicked.connect(self._trigger_test_alert)
+        self.trigger_test_btn.setEnabled(False)
+        dev_layout.addWidget(self.trigger_test_btn)
+        settings_layout.addWidget(dev_group)
+
+        save_btn = QPushButton("保存设置")
+        save_btn.clicked.connect(self._save_settings)
+        settings_layout.addWidget(save_btn)
+        settings_layout.addStretch()
+
+        self.tabs.addTab(settings_widget, "设置")
+
+        # --- Checkout Assistant ---
+        checkout_widget = QWidget()
+        checkout_layout = QVBoxLayout(checkout_widget)
+
+        checkout_warning = QLabel("⚠️ Checkout Assistant 默认关闭。启用后，检测到库存时可自动推进到付款前，但最终付款必须由您本人完成。程序绝不保存密码、验证码或支付信息。")
+        checkout_warning.setWordWrap(True)
+        checkout_warning.setStyleSheet("color: #e67e22; font-weight: bold;")
+        checkout_layout.addWidget(checkout_warning)
+
+        checkout_switch_group = QGroupBox("功能开关")
+        switch_layout = QVBoxLayout(checkout_switch_group)
+        self.checkout_enabled_cb = QCheckBox("启用 Checkout Assistant")
+        self.checkout_enabled_cb.setChecked(self.checkout.enabled)
+        self.checkout_enabled_cb.stateChanged.connect(self._toggle_checkout)
+        switch_layout.addWidget(self.checkout_enabled_cb)
+
+        self.checkout_auto_open_cb = QCheckBox("自动打开购买页")
+        self.checkout_auto_open_cb.setChecked(self.checkout.auto_open_page)
+        self.checkout_auto_open_cb.stateChanged.connect(self._on_checkout_option_changed)
+        switch_layout.addWidget(self.checkout_auto_open_cb)
+
+        self.checkout_auto_select_cb = QCheckBox("自动选中候选取货门店（需装本地扩展：Chrome/Edge 或 Safari）")
+        self.checkout_auto_select_cb.setChecked(self.checkout.auto_select_store)
+        self.checkout_auto_select_cb.stateChanged.connect(self._on_checkout_option_changed)
+        switch_layout.addWidget(self.checkout_auto_select_cb)
+
+        store_hint = QLabel(
+            "打开购买页时，把这个 SKU 本轮所有有货门店按优先级写进 URL 的 # 片段（不会发给 Apple）；"
+            "扩展会自动点开“查看供货情况”，等 Apple 自己加载出取货门店列表后，选中当前仍可取的最高优先门店，"
+            "然后停下，绝不点“继续”、不加入购物袋、不结账、不付款。"
+            "上面的“打开方式”选系统默认浏览器就装 browser_extension/apple_store_selector/（Chrome/Edge 未打包扩展）；"
+            "选 Safari 就装 ~/Applications/DuoMonitorStoreSelector.app。两边跑的是同一份门店选择逻辑。")
+        store_hint.setWordWrap(True)
+        store_hint.setStyleSheet("color: #7f8c8d;")
+        switch_layout.addWidget(store_hint)
+
+        self.checkout_auto_cart_cb = QCheckBox("自动加入购物袋")
+        self.checkout_auto_cart_cb.setChecked(self.checkout.auto_add_to_cart)
+        self.checkout_auto_cart_cb.stateChanged.connect(self._on_checkout_option_changed)
+        switch_layout.addWidget(self.checkout_auto_cart_cb)
+
+        self.checkout_auto_fill_cb = QCheckBox("自动填写收货信息")
+        self.checkout_auto_fill_cb.setChecked(self.checkout.auto_fill_details)
+        self.checkout_auto_fill_cb.stateChanged.connect(self._on_checkout_option_changed)
+        switch_layout.addWidget(self.checkout_auto_fill_cb)
+
+        self.checkout_auto_checkout_cb = QCheckBox("自动进入结账")
+        self.checkout_auto_checkout_cb.setChecked(self.checkout.auto_start_checkout)
+        self.checkout_auto_checkout_cb.stateChanged.connect(self._on_checkout_option_changed)
+        switch_layout.addWidget(self.checkout_auto_checkout_cb)
+
+        browser_layout = QHBoxLayout()
+        browser_layout.addWidget(QLabel("打开方式:"))
+        self.checkout_browser_combo = QComboBox()
+        self.checkout_browser_combo.addItem("系统默认浏览器", "default")
+        self.checkout_browser_combo.addItem("Safari（open -a Safari）", "safari")
+        browser_idx = self.checkout_browser_combo.findData(self.checkout.browser)
+        self.checkout_browser_combo.setCurrentIndex(browser_idx if browser_idx >= 0 else 0)
+        self.checkout_browser_combo.currentIndexChanged.connect(self._on_checkout_browser_changed)
+        browser_layout.addWidget(self.checkout_browser_combo)
+        browser_layout.addStretch()
+        switch_layout.addLayout(browser_layout)
+
+        checkout_rule_label = QLabel(
+            f"防重复：同一 SKU 冷却 {self.checkout.cooldown_seconds} 秒，两轮打开最小间隔 "
+            f"{self.checkout.min_open_interval_seconds} 秒，每轮最多 {self.checkout.max_tabs_per_wave} 个标签页；"
+            "启动后第一次 Cloud 数据只建立基线，不打开页面。")
+        checkout_rule_label.setWordWrap(True)
+        checkout_rule_label.setStyleSheet("color: #7f8c8d;")
+        switch_layout.addWidget(checkout_rule_label)
+
+        prio_layout = QHBoxLayout()
+        prio_layout.addWidget(QLabel("一级重点门店:"))
+        self.checkout_tier1_edit = QLineEdit(", ".join(self.checkout.priority_tier1))
+        self.checkout_tier1_edit.setPlaceholderText("Store ID，逗号分隔，如 R793, R484, R761")
+        self.checkout_tier1_edit.editingFinished.connect(self._on_checkout_priority_changed)
+        prio_layout.addWidget(self.checkout_tier1_edit)
+        prio_layout.addWidget(QLabel("二级重点门店:"))
+        self.checkout_tier2_edit = QLineEdit(", ".join(self.checkout.priority_tier2))
+        self.checkout_tier2_edit.setPlaceholderText("如 R577, R639")
+        self.checkout_tier2_edit.editingFinished.connect(self._on_checkout_priority_changed)
+        prio_layout.addWidget(self.checkout_tier2_edit)
+        switch_layout.addLayout(prio_layout)
+        self.checkout_only_priority_cb = QCheckBox("只为重点门店自动打开页面（其它城市只通知、不开页）；重点门店不受冷却限制，一级优先于二级")
+        self.checkout_only_priority_cb.setChecked(self.checkout.open_only_priority)
+        self.checkout_only_priority_cb.stateChanged.connect(self._on_checkout_priority_changed)
+        switch_layout.addWidget(self.checkout_only_priority_cb)
+        quiet_layout = QHBoxLayout()
+        quiet_layout.addWidget(QLabel("静音时段（本地时间）:"))
+        self.checkout_quiet_edit = QLineEdit(self.checkout.quiet_hours)
+        self.checkout_quiet_edit.setPlaceholderText("如 23:00-07:00；留空 = 任何时候都用可穿透静音的重要警报")
+        self.checkout_quiet_edit.setFixedWidth(160)
+        self.checkout_quiet_edit.editingFinished.connect(self._on_checkout_priority_changed)
+        quiet_layout.addWidget(self.checkout_quiet_edit)
+        quiet_layout.addWidget(QLabel("时段内深圳推送降为普通等级（送达但不吵醒）"))
+        quiet_layout.addStretch()
+        switch_layout.addLayout(quiet_layout)
+        prio_save_layout = QHBoxLayout()
+        self.checkout_prio_save_btn = QPushButton("保存重点门店 / 静音设置")
+        self.checkout_prio_save_btn.clicked.connect(self._on_checkout_priority_changed)
+        prio_save_layout.addWidget(self.checkout_prio_save_btn)
+        self.checkout_prio_status = QLabel("输入后按回车或点此按钮保存")
+        self.checkout_prio_status.setStyleSheet("color: #7f8c8d;")
+        prio_save_layout.addWidget(self.checkout_prio_status)
+        prio_save_layout.addStretch()
+        switch_layout.addLayout(prio_save_layout)
+        prio_note = QLabel("门店表格的置顶/高亮按此设置，修改后重启 App 生效；开页/通知规则立即生效。")
+        prio_note.setStyleSheet("color: #7f8c8d;")
+        switch_layout.addWidget(prio_note)
+        checkout_layout.addWidget(checkout_switch_group)
+
+        # 状态显示
+        checkout_state_group = QGroupBox("当前状态")
+        state_layout = QVBoxLayout(checkout_state_group)
+        self.checkout_state_label = QLabel(f"状态: {self.checkout.state.value}")
+        self.checkout_state_label.setFont(QFont("Menlo", 12))
+        state_layout.addWidget(self.checkout_state_label)
+        self.checkout_sku_label = QLabel("当前 SKU: -")
+        state_layout.addWidget(self.checkout_sku_label)
+        self.checkout_store_label = QLabel("当前门店: -")
+        state_layout.addWidget(self.checkout_store_label)
+        checkout_layout.addWidget(checkout_state_group)
+
+        # 用户资料
+        profile_group = QGroupBox("收货资料（暂未使用：到店取货不需要地址，取货人信息在 Apple 结账页填写；仅本机保存，权限600）")
+        profile_layout = QVBoxLayout(profile_group)
+        self.profile_name_edit = QLineEdit()
+        self.profile_name_edit.setPlaceholderText("姓名")
+        profile_layout.addWidget(self.profile_name_edit)
+        self.profile_phone_edit = QLineEdit()
+        self.profile_phone_edit.setPlaceholderText("手机号")
+        profile_layout.addWidget(self.profile_phone_edit)
+        self.profile_address_edit = QLineEdit()
+        self.profile_address_edit.setPlaceholderText("配送地址（仅配送时使用）")
+        profile_layout.addWidget(self.profile_address_edit)
+
+        profile_btn_layout = QHBoxLayout()
+        save_profile_btn = QPushButton("保存资料")
+        save_profile_btn.clicked.connect(self._save_checkout_profile)
+        clear_profile_btn = QPushButton("一键清除资料")
+        clear_profile_btn.clicked.connect(self._clear_checkout_profile)
+        profile_btn_layout.addWidget(save_profile_btn)
+        profile_btn_layout.addWidget(clear_profile_btn)
+        profile_layout.addLayout(profile_btn_layout)
+        self.checkout_profile_status = QLabel("")
+        self.checkout_profile_status.setStyleSheet("color: #7f8c8d;")
+        profile_layout.addWidget(self.checkout_profile_status)
+        checkout_layout.addWidget(profile_group)
+
+        # 安全声明
+        security_label = QLabel("""安全承诺：
+✓ 不保存 Apple ID 密码
+✓ 不保存 2FA/短信验证码
+✓ 不保存 CVV/支付密码
+✓ 不导出 Cookie/session token
+✓ 不自动提交订单
+✓ 不自动付款
+遇到登录/验证码/CAPTCHA 时立即暂停，等待您处理""")
+        security_label.setStyleSheet("color: #27ae60; font-family: Menlo;")
+        checkout_layout.addWidget(security_label)
+
+        checkout_layout.addStretch()
+        self.tabs.addTab(checkout_widget, "Checkout Assistant")
+
+        # --- China Control ---
+        china_widget = QWidget()
+        china_layout = QVBoxLayout(china_widget)
+
+        china_info = QLabel("中国大陆对照组 — iPhone 18 Pro 512GB 白色（Glacier）\n"
+                           "Part Number: MJTF4CH/A | 频率: 90秒 | 门店: 广东/南京/上海\n"
+                           "用途: 诊断对照，默认不发高优先级通知")
+        china_info.setFont(QFont("Menlo", 11))
+        china_info.setStyleSheet("padding: 10px; background: #f8f9fa; border-radius: 5px;")
+        china_layout.addWidget(china_info)
+
+        china_status_group = QGroupBox("当前状态")
+        china_status_layout = QVBoxLayout(china_status_group)
+        self.china_status_label = QLabel("等待监控启动...")
+        self.china_status_label.setFont(QFont("Menlo", 12))
+        china_status_layout.addWidget(self.china_status_label)
+        china_layout.addWidget(china_status_group)
+
+        self.china_control_table = QTableWidget()
+        self.china_control_table.setColumnCount(4)
+        self.china_control_table.setHorizontalHeaderLabels(["城市", "Apple Store", "Store ID", "库存状态"])
+        self.china_control_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.china_control_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        china_layout.addWidget(self.china_control_table)
+
+        china_layout.addStretch()
+        self.tabs.addTab(china_widget, "China Control")
+
+        # --- Australia Control ---
+        au_widget = QWidget()
+        au_layout = QVBoxLayout(au_widget)
+
+        au_info = QLabel("澳大利亚对照组 — Adelaide Apple Store\n"
+                        "Duo 512GB Star White: MK2F4X/A | iPhone 18 Pro 512GB Glacier: MJRX4X/A\n"
+                        "门店: Apple Rundle Place (R405) | 频率: 60秒\n"
+                        "用途: 本地对照，默认不发高优先级通知")
+        au_info.setFont(QFont("Menlo", 11))
+        au_info.setStyleSheet("padding: 10px; background: #f8f9fa; border-radius: 5px;")
+        au_layout.addWidget(au_info)
+
+        au_status_group = QGroupBox("当前状态")
+        au_status_layout = QVBoxLayout(au_status_group)
+        self.au_status_label = QLabel("等待监控启动...")
+        self.au_status_label.setFont(QFont("Menlo", 12))
+        au_status_layout.addWidget(self.au_status_label)
+        au_layout.addWidget(au_status_group)
+
+        self.au_table = QTableWidget()
+        self.au_table.setColumnCount(4)
+        self.au_table.setHorizontalHeaderLabels(["Apple Store", "Store ID", "Duo 512GB", "iPhone 18 Pro"])
+        self.au_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.au_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        au_layout.addWidget(self.au_table)
+
+        au_layout.addStretch()
+        self.tabs.addTab(au_widget, "Australia Control")
+
+        # --- Market Watch ---
+        mw_widget = QWidget()
+        mw_layout = QVBoxLayout(mw_widget)
+
+        mw_info = QLabel("二级市场溢价趋势 — iPhone Duo\n"
+                        "数据源: 手动输入（闲鱼/淘宝需登录，标记不可用）\n"
+                        "频率: 60分钟 | 数据仅保存在本机")
+        mw_info.setFont(QFont("Menlo", 11))
+        mw_info.setStyleSheet("padding: 10px; background: #f8f9fa; border-radius: 5px;")
+        mw_layout.addWidget(mw_info)
+
+        mw_input_group = QGroupBox("手动添加报价")
+        mw_input_layout = QHBoxLayout(mw_input_group)
+        self.mw_sku_combo = QComboBox()
+        self.mw_sku_combo.addItems(["512GB 星光白", "512GB 夜空色", "1TB 星光白", "1TB 夜空色"])
+        self.mw_price_input = QLineEdit()
+        self.mw_price_input.setPlaceholderText("价格（元）")
+        self.mw_add_btn = QPushButton("添加")
+        self.mw_add_btn.clicked.connect(self._add_market_sample)
+        mw_input_layout.addWidget(QLabel("SKU:"))
+        mw_input_layout.addWidget(self.mw_sku_combo)
+        mw_input_layout.addWidget(QLabel("价格:"))
+        mw_input_layout.addWidget(self.mw_price_input)
+        mw_input_layout.addWidget(self.mw_add_btn)
+        mw_layout.addWidget(mw_input_group)
+
+        self.mw_table = QTableWidget()
+        self.mw_table.setColumnCount(8)
+        self.mw_table.setHorizontalHeaderLabels(
+            ["SKU", "官网价", "最低价", "中位价", "平均价", "溢价金额", "溢价%", "样本数"])
+        self.mw_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.mw_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        mw_layout.addWidget(self.mw_table)
+
+        mw_layout.addStretch()
+        self.tabs.addTab(mw_widget, "Market Watch")
+
+        # ===== Diagnostics 标签页（v1.5.0）=====
+        diag_widget = QWidget()
+        diag_layout = QVBoxLayout(diag_widget)
+
+        # 网络会话信息
+        session_group = QGroupBox("当前网络会话")
+        session_layout = QVBoxLayout()
+        self.diag_session_label = QLabel("Session: - | IP: - | ISP: -")
+        session_layout.addWidget(self.diag_session_label)
+        session_group.setLayout(session_layout)
+        diag_layout.addWidget(session_group)
+
+        # 三端对比
+        compare_group = QGroupBox("App vs Sentinel 对比")
+        compare_layout = QVBoxLayout()
+        self.diag_compare_table = QTableWidget()
+        self.diag_compare_table.setColumnCount(6)
+        self.diag_compare_table.setHorizontalHeaderLabels(
+            ["模块", "总请求", "200", "541", "成功率", "连续541"])
+        self.diag_compare_table.setRowCount(3)
+        self.diag_compare_table.setItem(0, 0, QTableWidgetItem("App Pickup"))
+        self.diag_compare_table.setItem(1, 0, QTableWidgetItem("Sentinel A (requests)"))
+        self.diag_compare_table.setItem(2, 0, QTableWidgetItem("Sentinel B (curl)"))
+        compare_layout.addWidget(self.diag_compare_table)
+        compare_group.setLayout(compare_layout)
+        diag_layout.addWidget(compare_group)
+
+        # DIVERGENCE EVENTS
+        divergence_group = QGroupBox("DIVERGENCE EVENTS（App=541/Sentinel=200）")
+        divergence_layout = QVBoxLayout()
+        self.diag_divergence_text = QTextEdit()
+        self.diag_divergence_text.setReadOnly(True)
+        self.diag_divergence_text.setMaximumHeight(150)
+        divergence_layout.addWidget(self.diag_divergence_text)
+        divergence_group.setLayout(divergence_layout)
+        diag_layout.addWidget(divergence_group)
+
+        # 操作按钮
+        diag_btn_layout = QHBoxLayout()
+        self.diag_refresh_btn = QPushButton("刷新诊断数据")
+        self.diag_refresh_btn.clicked.connect(self._refresh_diagnostics)
+        self.diag_summary_btn = QPushButton("生成晨间摘要")
+        self.diag_summary_btn.clicked.connect(self._generate_diag_summary)
+        diag_btn_layout.addWidget(self.diag_refresh_btn)
+        diag_btn_layout.addWidget(self.diag_summary_btn)
+        diag_layout.addLayout(diag_btn_layout)
+
+        # 诊断说明
+        diag_note = QLabel(
+            "Sentinel A: Python requests，每30秒 | "
+            "Sentinel B: curl，每30秒（错开15秒）\n"
+            "诊断模块完全旁路，不影响主库存监控、通知和 Checkout Assistant。"
+        )
+        diag_note.setStyleSheet("color: #888; font-size: 11px;")
+        diag_layout.addWidget(diag_note)
+
+        diag_layout.addStretch()
+        self.tabs.addTab(diag_widget, "Diagnostics")
+
+        # 重新排序 Tab：常用功能靠前，诊断类靠后
+        tab_order = ["库存看板", "Checkout Assistant", "Market Watch", "设置", "API 统计", "日志", "China Control", "Australia Control", "Diagnostics"]
+        tabs_data = []
+        for i in range(self.tabs.count()):
+            tabs_data.append((self.tabs.tabText(i), self.tabs.widget(i)))
+        while self.tabs.count() > 0:
+            self.tabs.removeTab(0)
+        for title in tab_order:
+            for t, w in tabs_data:
+                if t == title:
+                    self.tabs.addTab(w, title)
+                    break
+
+        # ===== 底部状态栏 =====
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage(f"就绪 | {DEVELOPER_NAME}")
+
+    def _setup_store_table(self):
+        enabled_skus = get_enabled_skus(self.all_skus)
+        # 列标题包含型号前缀
+        sku_headers = []
+        self._sku_col_map = {}  # sku_id -> column index
+        for i, s in enumerate(enabled_skus):
+            group = s.get("group", "duo")
+            model = "18PM" if group == "iphone18promax" else "Duo"
+            sku_headers.append(f"{model} {s['capacity']}\n{s['color']}")
+            self._sku_col_map[s["id"]] = i + 3  # 前3列是城市/门店/Store ID
+        columns = ["城市", "Apple Store", "Store ID"] + sku_headers + ["最后已知", "更新时间"]
+        self.store_table.setColumnCount(len(columns))
+        self.store_table.setHorizontalHeaderLabels(columns)
+
+        store_numbers = get_all_store_numbers(self.stores)
+        # 重点门店置顶：一级（深圳）→ 二级（广州）→ 其它；同级保持 stores.json 顺序
+        store_numbers = sorted(store_numbers, key=lambda sn: {1: 0, 2: 1}.get(self.checkout.store_tier(sn), 2))
+        self.store_table.setRowCount(len(store_numbers))
+
+        for row, sn in enumerate(store_numbers):
+            store_info = self.store_map.get(sn, {})
+            tier = self.checkout.store_tier(sn)
+            city_text = store_info.get("city", "")
+            if tier == 1:
+                city_text = f"★ {city_text}"
+            elif tier == 2:
+                city_text = f"☆ {city_text}"
+            self.store_table.setItem(row, 0, QTableWidgetItem(city_text))
+            self.store_table.setItem(row, 1, QTableWidgetItem(store_info.get("name", store_info.get("store_name", sn))))
+            self.store_table.setItem(row, 2, QTableWidgetItem(sn))
+            for col in range(len(columns)):
+                item = self.store_table.item(row, col)
+                if item:
+                    item.setTextAlignment(Qt.AlignCenter)
+            if tier:
+                bg = QColor("#d6eaf8" if tier == 1 else "#eaf2f8")
+                for col in (0, 1, 2):
+                    it = self.store_table.item(row, col)
+                    it.setBackground(bg)
+                    if tier == 1:
+                        f = it.font(); f.setBold(True); it.setFont(f)
+
+        self.store_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.store_table.verticalHeader().setVisible(False)
+        self.store_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.store_table.setAlternatingRowColors(True)
+        self.store_table.setSelectionMode(QTableWidget.NoSelection)
+        self.store_table.setFocusPolicy(Qt.NoFocus)
+        # 16 行一屏看全：固定行高 + 最小高度 = 表头 + 行数×行高，关闭纵向滚动条
+        row_h = 24
+        header_h = 40
+        vh = self.store_table.verticalHeader()
+        vh.setMinimumSectionSize(row_h)
+        vh.setDefaultSectionSize(row_h)
+        for r in range(self.store_table.rowCount()):
+            self.store_table.setRowHeight(r, row_h)
+        self.store_table.horizontalHeader().setFixedHeight(header_h)
+        self.store_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        fixed_h = header_h + row_h * self.store_table.rowCount() + 2 * self.store_table.frameWidth() + 2
+        self.store_table.setMinimumHeight(fixed_h)
+        self.store_table.setMaximumHeight(fixed_h)
+
+    def _setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("iPhone Duo 库存监控")
+
+        tray_menu = QMenu()
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self.show)
+        tray_menu.addAction(show_action)
+
+        status_action = QAction("当前状态: 运行中", self)
+        status_action.setEnabled(False)
+        tray_menu.addAction(status_action)
+        self.tray_status_action = status_action
+
+        tray_menu.addSeparator()
+        quit_action = QAction("退出程序", self)
+        quit_action.triggered.connect(self.quit_app)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+
+    def start_monitoring(self):
+        if self.monitor_thread and self.monitor_thread.isRunning():
+            return
+        # 本地模式下，Cloud 卡片显示未启用
+        if not self.cloud_mode:
+            self._update_card(self.cloud_card, "本地模式", "#3498db")
+        self.monitor_thread = QThread()
+        self.monitor_worker = MonitorWorker(self.config_dir)
+        self.monitor_worker.moveToThread(self.monitor_thread)
+        self.monitor_thread.started.connect(self.monitor_worker.start)
+        self.monitor_worker.status_update.connect(self._on_status_update)
+        self.monitor_worker.log_message.connect(self._on_log_message)
+        self.monitor_worker.alert_signal.connect(self._on_alert)
+        self.monitor_worker.api_record.connect(self._on_api_record)
+        self.monitor_thread.start()
+        self.status_bar.showMessage("监控运行中...")
+        self._append_log("GUI 监控线程已启动")
+
+    def stop_monitoring(self):
+        if self.monitor_worker:
+            self.monitor_worker.stop()
+        if self.monitor_thread:
+            self.monitor_thread.quit()
+            self.monitor_thread.wait(10000)
+            if self.monitor_thread.isRunning():
+                self.monitor_thread.terminate()
+                self.monitor_thread.wait(3000)
+        self.monitor_worker = None
+        self.monitor_thread = None
+        self.status_bar.showMessage("监控已停止")
+        self._append_log("监控已停止")
+
+    # ===== v2.0: Cloud 模式 =====
+
+    def _start_cloud_mode(self):
+        """启动 Cloud 模式，从云端读取状态，不启动本地 Monitor"""
+        from cloud_client import CloudClient
+
+        server_url = self.cloud_url_edit.text().strip()
+        auth_token = self.cloud_token_edit.text().strip()
+
+        if not server_url or not auth_token:
+            self._update_card(self.cloud_card, "未配置", "#e74c3c")
+            self.status_bar.showMessage("Cloud 模式未配置，请在设置中填写服务器地址和 Token")
+            # 回退到本地模式
+            self.cloud_mode = False
+            QTimer.singleShot(1000, self.start_monitoring)
+            return
+
+        backup_url = self.cloud_backup_url_edit.text().strip() if hasattr(self, "cloud_backup_url_edit") else ""
+        # Mac 向服务器 /status 拉取的间隔（秒）。/status 是服务器缓存的纯读接口，
+        # 拉多快都不会触发一次 Apple 请求（已实测：连拉 6 次 check_count 按服务器自己节奏走，
+        # 不随拉取推动）。所以这只影响 Mac 多快看到服务器已经发现的有货，全程走 Tailscale。
+        cloud_poll_interval = int(self.config.get("cloud", {}).get("poll_interval", 2))
+        if cloud_poll_interval <= 0:
+            cloud_poll_interval = 2
+        if backup_url:
+            from cloud_client import MultiCloudClient
+            self.cloud_client = MultiCloudClient([server_url, backup_url], auth_token, poll_interval=cloud_poll_interval)
+        else:
+            self.cloud_client = CloudClient(server_url, auth_token, poll_interval=cloud_poll_interval)
+        self._cloud_active_urls = (server_url, backup_url)
+        # 回调在后台线程，通过信号转到主线程更新 GUI
+        self.cloud_client.status_callback = lambda status, online, error: self.cloud_status_received.emit(status, online, error)
+        self.cloud_client.start()
+        self._start_cloud_caffeinate()
+
+        self._update_card(self.cloud_card, "连接中...", "#f39c12")
+        self.status_bar.showMessage("Cloud 模式运行中（本地 Monitor 已关闭）")
+        self._append_log(f"Cloud 模式已启动: {server_url}" + (f" + 备用 {backup_url}" if backup_url else ""))
+
+        # 更新顶部面板显示 Cloud 模式
+        self._update_card(self.pickup_card, "等待数据...", "#f39c12")
+
+    def _stop_cloud_mode(self):
+        """停止 Cloud 模式"""
+        self._stop_cloud_caffeinate()
+        if self.cloud_client:
+            self.cloud_client.stop()
+            self.cloud_client = None
+        self._update_card(self.cloud_card, "已停止", "#95a5a6")
+
+    def _on_cloud_status_update(self, status_data, online, error):
+        """Cloud 状态更新回调"""
+        if online and status_data:
+            self._update_server_cards(status_data, True)
+
+            # 更新顶部状态卡片
+            monitor = status_data.get("monitor", {})
+            pickup = status_data.get("pickup", {})
+            delivery = status_data.get("delivery", {})
+
+            # Pickup 状态
+            pickup_available = pickup.get("api_available")
+            if pickup_available:
+                self._update_card(self.pickup_card, "正常", "#27ae60")
+            else:
+                self._update_card(self.pickup_card, "异常", "#e74c3c")
+
+            # 供货趋势状态（从 trends 数据判断）
+            trends = status_data.get("trends", {})
+            if trends and "error" not in trends:
+                overview = trends.get("overview", {})
+                current_stores = overview.get("current_available_stores", 0)
+                total_stores = overview.get("total_stores", 0)
+                restocks_24h = overview.get("restocks_24h", 0)
+                self._update_card(self.trend_card, f"{current_stores}/{total_stores}店", "#27ae60" if current_stores > 0 else "#95a5a6")
+            else:
+                self._update_card(self.trend_card, "趋势数据加载中", "#95a5a6")
+
+            # 最后更新时间
+            if monitor.get("last_check"):
+                from datetime import datetime as dt
+                last_time = dt.fromtimestamp(monitor['last_check']).strftime('%H:%M:%S')
+                self._update_card(self.last_update_card, last_time, "#2c3e50")
+
+            # 成功率
+            api_stats = status_data.get("api_stats", {})
+            if api_stats:
+                success_rate = api_stats.get("success_rate", 0)
+                self._update_card(self.success_rate_card, f"{success_rate:.0f}%", "#27ae60" if success_rate > 80 else "#f39c12")
+
+            # 次级技术信息
+            check_count = monitor.get("check_count", 0)
+            self._check_count = check_count
+            self.tech_info_label.setText(
+                f"Cloud 轮询: 每 5 秒 | 累计检查(活跃源): {check_count} | "
+                f"{getattr(self, '_server_tech_text', '') or '-'}"
+            )
+
+            # 更新供货趋势（从云端 trends 数据）
+            self._update_trends_from_cloud(status_data)
+
+            # 更新对照组页面（从云端数据读取）
+            self._update_china_control(status_data)
+            self._update_australia_control(status_data)
+
+            # 检测库存变化并触发本地通知
+            inventory = status_data.get("inventory", {})
+            self._detect_cloud_inventory_changes(inventory)
+
+            # 更新库存表
+            self._update_store_table_from_cloud(inventory)
+
+        else:
+            self._update_server_cards(status_data, False)
+            self._update_card(self.pickup_card, "云端离线", "#e74c3c")
+            # 不显示无货，保持最后已知状态
+
+    def _update_trends_from_cloud(self, status_data):
+        """从云端数据更新供货趋势显示"""
+        from datetime import datetime as dt
+        trends = status_data.get("trends", {})
+
+        if not trends or "error" in trends:
+            for key in self.trend_labels:
+                self.trend_labels[key].setText("-")
+            self.trend_pulse_label.setText("趋势数据暂不可用")
+            self.trend_events_label.setText("趋势数据暂不可用")
+            return
+
+        # 概览指标
+        overview = trends.get("overview", {})
+        current_stores = overview.get("current_available_stores", 0)
+        total_stores = overview.get("total_stores", 0)
+        self.trend_labels["current_stores"].setText(f"{current_stores}/{total_stores}")
+        self.trend_labels["restock_1h"].setText(str(overview.get("restocks_1h", 0)))
+        self.trend_labels["restock_6h"].setText(str(overview.get("restocks_6h", 0)))
+        self.trend_labels["restock_24h"].setText(str(overview.get("restocks_24h", 0)))
+
+        last_restock_time = overview.get("last_restock_time")
+        if last_restock_time:
+            self.trend_labels["last_restock"].setText(dt.fromtimestamp(last_restock_time).strftime('%H:%M'))
+        else:
+            self.trend_labels["last_restock"].setText("-")
+        self.trend_labels["active_city"].setText(overview.get("most_active_city", "-"))
+
+        # 补货脉冲
+        pulse = trends.get("restock_pulse", {})
+        pulse_text = f"最近30分钟补货: {pulse.get('restocks_30m', 0)}次"
+        if pulse.get("is_active"):
+            pulse_text += " ⚡补货活跃"
+        by_city = pulse.get("by_city", {})
+        if by_city:
+            city_str = " | ".join(f"{c}:{n}" for c, n in sorted(by_city.items(), key=lambda x: -x[1])[:3])
+            pulse_text += f"\n{city_str}"
+        self.trend_pulse_label.setText(pulse_text)
+
+        # 最近补货事件
+        events = trends.get("recent_events", [])
+        if events:
+            event_lines = []
+            for e in events[-8:]:
+                time_str = dt.fromtimestamp(e["timestamp"]).strftime('%H:%M')
+                sku_name = e.get("product_name", e.get("sku_id", ""))
+                store_name = e.get("store_name", e.get("store_number", ""))
+                if e.get("is_restock"):
+                    event_lines.append(f"{time_str} {store_name}｜{sku_name}｜补货")
+                elif e.get("is_sold_out"):
+                    event_lines.append(f"{time_str} {store_name}｜{sku_name}｜售罄")
+            self.trend_events_label.setText("\n".join(event_lines) if event_lines else "暂无事件")
+        else:
+            self.trend_events_label.setText("暂无补货事件")
+
+    def _detect_cloud_inventory_changes(self, inventory):
+        """检测云端库存变化，触发 macOS 本地通知、声音和消息栏"""
+        if not inventory:
+            return
+
+        from datetime import datetime as dt
+        time_str = dt.now().strftime('%H:%M:%S')
+
+        # Checkout Assistant：App 启动后第一次收到非空 snapshot 只建立 baseline，不打开页面
+        checkout_initial_snapshot = not self._cloud_last_inventory
+        checkout_hits = []
+        wave_events = []
+
+        # inventory 格式: {"sku_id|store_number": {"available": True/False/None, ...}}
+        for key, state in inventory.items():
+            if "|" not in key:
+                continue
+            available = state.get("available")
+            prev = self._cloud_last_inventory.get(key, {}).get("available")
+
+            # 解析 SKU 和门店
+            parts = key.split("|", 1)
+            sku_id = parts[0]
+            store_number = parts[1]
+
+            # 获取 SKU 名称
+            sku_name = sku_id
+            sku_info = {}
+            for sku in self.all_skus:
+                if sku.get("id") == sku_id or sku.get("part_number") == sku_id:
+                    sku_info = sku
+                    sku_name = f"{sku.get('capacity','')} {sku.get('color','')}"
+                    break
+
+            # 获取门店名称和城市
+            store_name = store_number
+            city = ""
+            for region_name, region_data in self.stores.get("regions", {}).items():
+                for s in region_data.get("stores", []):
+                    if s.get("store_number") == store_number:
+                        store_name = s.get("name", s.get("store_name", store_number))
+                        city = s.get("city", region_name)
+                        break
+                if store_name != store_number:
+                    break
+
+            tier = self.checkout.store_tier(store_number)
+            location = f"{city} {store_name}" if city else store_name
+            if tier == 1:
+                location = f"★ {location}"
+            elif tier == 2:
+                location = f"☆ {location}"
+
+            # 状态变化检测
+            if available is True and prev is not True:
+                # 从无货/未知变为有货。把 Apple 给的取货日期带出来（例如"周六 09/19 可取"），
+                # 免得把几天后才能取的名额当成能马上抢的现货。只显示，不影响任何判定和开页
+                detail = state.get("detail") or {}
+                pickup_label = pickup_date_label(detail.get("pickup_search_quote"),
+                                                 detail.get("store_pickup_quote"))
+                status_text = "有货 ✓" + (f" · {pickup_label}" if pickup_label else "")
+                self._add_inventory_message(time_str, sku_name, location, "pickup", status_text, is_available=True)
+                wave_events.append({"sku_name": sku_name, "store_name": store_name,
+                                    "store_number": store_number, "city": city, "tier": tier,
+                                    "pickup_label": pickup_label})
+
+                # 自动打开购买页（旧开关）。Checkout Assistant 启用时由其统一去重打开，避免双开
+                if self.config.get("notification", {}).get("auto_open_buy_page", False) and not self.checkout.enabled:
+                    self._open_buy_page(sku_id)
+
+                self._append_log(f"[Cloud通知] {sku_name} @ {store_name} 有货！"
+                                 + (f"（{pickup_label}）" if pickup_label else ""))
+
+                if self.checkout.enabled:
+                    checkout_hits.append({
+                        "sku_id": sku_id,
+                        "part_number": sku_info.get("part_number", sku_id),
+                        "sku_name": sku_info.get("name", sku_name),
+                        "capacity": sku_info.get("capacity", ""),
+                        "color": sku_info.get("color", ""),
+                        "store_number": store_number,
+                        "store_name": store_name,
+                        "city": city,
+                        "pickup_label": pickup_label,
+                    })
+
+            elif available is False and prev is True:
+                # 从有货变为无货
+                self._add_inventory_message(time_str, sku_name, location, "pickup", "无货", is_available=False)
+
+        # 更新上次状态
+        self._cloud_last_inventory = inventory
+
+        # 同一轮的有货变化合并成一条通知（深圳/广州排前，避免开抢时几十条通知刷屏）
+        if wave_events and not checkout_initial_snapshot:
+            self._notify_wave(wave_events)
+        elif wave_events:
+            self._append_log(f"[Cloud通知] 启动基线：当前已有 {len(wave_events)} 条有货状态，不重复通知")
+
+        if checkout_hits:
+            self._run_checkout_assistant(checkout_hits, initial_snapshot=checkout_initial_snapshot)
+
+    def _run_checkout_assistant(self, hits, initial_snapshot=False):
+        """Mac 本地外围层：把本轮命中交给 Checkout Assistant，结果只写日志和消息栏，不发额外系统通知"""
+        try:
+            results = self.checkout.on_stock_wave(hits, initial_snapshot=initial_snapshot)
+        except Exception as e:
+            self._append_log(f"[Checkout] 异常（不影响监控）: {e}")
+            return
+        time_str = datetime.now().strftime('%H:%M:%S')
+        for r in results:
+            self._append_log(f"[Checkout] {r['message']}{'｜已推送手机' if r.get('pushed') else ''}")
+            if r.get("opened"):
+                status = "已打开购买页"
+                if self.checkout.auto_select_store and r.get("candidate_label"):
+                    status += f" · 候选门店 {r['candidate_label']}"
+                self._add_inventory_message(time_str, r["product_label"], r["stores_label"],
+                                            "pickup", status, is_available=True)
+        self._update_checkout_state()
+
+    def _notify_wave(self, events):
+        """把一轮里的多条有货变化合并为一条 macOS 通知；一级重点排最前，其它城市只按数量汇总"""
+        if not events:
+            return
+        events = sorted(events, key=lambda e: (e["tier"] if e["tier"] else 9))
+        top = events[0]["tier"] if events[0]["tier"] else 0
+        top_city = events[0]["city"] if top else ""
+        by_sku = {}
+        for e in events:
+            d = by_sku.setdefault(e["sku_name"], {"p": [], "other": {}, "tier": 9})
+            if e["tier"]:
+                label = e.get("pickup_label") or ""
+                d["p"].append(f"{e['store_name']}({e['store_number']})" + (f" {label}" if label else ""))
+                d["tier"] = min(d["tier"], e["tier"])
+            else:
+                c = e["city"] or "其它"
+                d["other"][c] = d["other"].get(c, 0) + 1
+        lines = []
+        for name, d in sorted(by_sku.items(), key=lambda kv: kv[1]["tier"]):
+            parts = []
+            if d["p"]:
+                parts.append("、".join(d["p"][:3]) + (f" 等{len(d['p'])}店" if len(d["p"]) > 3 else ""))
+            if d["other"]:
+                parts.append("，".join(f"{c} {n} 店" for c, n in d["other"].items()))
+            lines.append(f"{name} · " + "；".join(parts))
+        prefix = f"【{top_city or '重点'}】" if top else ""
+        title = f"{prefix}iPhone 有货（{len(events)} 条）"
+        body = "\n".join(lines[:4]) + (f"\n…还有 {len(lines) - 4} 个型号" if len(lines) > 4 else "")
+        sound = {1: "Hero", 2: "Glass"}.get(top, "Glass")
+        self._send_macos_notification(title, body, sound=sound)
+        if self.config.get("notification", {}).get("sound", True):
+            self._play_alert_sound()
+        self._last_wave_notification = {"title": title, "body": body, "sound": sound}
+
+    def _send_macos_notification(self, title, body, sound="Glass"):
+        """发送 macOS 系统通知"""
+        try:
+            import subprocess
+            body = str(body).replace('\\', '\\\\').replace('"', '\\"')
+            title = str(title).replace('\\', '\\\\').replace('"', '\\"')
+            script = f'display notification "{body}" with title "{title}" sound name "{sound}"'
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+        except Exception as e:
+            self._append_log(f"[通知失败] {e}")
+
+    def _play_alert_sound(self):
+        """播放提示音"""
+        try:
+            import subprocess
+            sound_file = self.config.get("notification", {}).get("sound_file", "/System/Library/Sounds/Glass.aiff")
+            subprocess.run(["afplay", sound_file], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    def _open_buy_page(self, sku_id):
+        """打开 Apple 官方购买页"""
+        try:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            # 构建 Apple 购买页 URL
+            part_number = sku_id
+            for sku in self.all_skus:
+                if sku.get("id") == sku_id:
+                    part_number = sku.get("part_number", sku_id)
+                    break
+            url = self.checkout.get_buy_url(part_number)
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception as e:
+            self._append_log(f"[打开购买页失败] {e}")
+
+    def _update_store_table_from_cloud(self, inventory):
+        """从云端库存数据更新表格"""
+        if not inventory:
+            return
+        try:
+            # 获取启用的 SKU 列表（用于列映射）
+            enabled_skus = get_enabled_skus(self.all_skus)
+
+            for row in range(self.store_table.rowCount()):
+                # Store ID 在第3列（index 2）
+                store_id_item = self.store_table.item(row, 2)
+                if not store_id_item:
+                    continue
+                store_number = store_id_item.text()
+                row_last_available = 0
+                row_last_checked = 0
+
+                for col, sku in enumerate(enabled_skus):
+                    if col + 3 >= self.store_table.columnCount():
+                        break
+                    sku_id = sku.get("id", sku.get("part_number", ""))
+                    key = f"{sku_id}|{store_number}"
+                    state = inventory.get(key, {})
+                    available = state.get("available")
+
+                    item = QTableWidgetItem()
+                    if available is True:
+                        item.setText("有货")
+                        item.setBackground(QColor("#27ae60"))
+                        item.setForeground(QColor("#ffffff"))
+                        f = item.font(); f.setBold(True); item.setFont(f)
+                    elif available is False:
+                        item.setText("无货")
+                        item.setForeground(QColor("#95a5a6"))
+                    else:
+                        item.setText("未知")
+                        item.setBackground(QColor("#fdebd0"))
+                        item.setForeground(QColor("#b9770e"))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self.store_table.setItem(row, col + 3, item)
+                    la = state.get("last_available")
+                    lc = state.get("last_checked")
+                    if la and la > row_last_available:
+                        row_last_available = la
+                    if lc and lc > row_last_checked:
+                        row_last_checked = lc
+
+                from datetime import datetime as _dt
+                last_col = self.store_table.columnCount() - 2
+                la_item = QTableWidgetItem(_dt.fromtimestamp(row_last_available).strftime("%m-%d %H:%M") if row_last_available else "-")
+                lc_item = QTableWidgetItem(_dt.fromtimestamp(row_last_checked).strftime("%H:%M:%S") if row_last_checked else "-")
+                for it in (la_item, lc_item):
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setForeground(QColor("#7f8c8d"))
+                self.store_table.setItem(row, last_col, la_item)
+                self.store_table.setItem(row, last_col + 1, lc_item)
+        except Exception as e:
+            self._append_log(f"[Cloud表格更新失败] {e}")
+
+    def _test_cloud_connection(self):
+        """测试 Cloud 连接"""
+        from cloud_client import CloudClient
+
+        server_url = self.cloud_url_edit.text().strip()
+        auth_token = self.cloud_token_edit.text().strip()
+
+        if not server_url or not auth_token:
+            QMessageBox.warning(self, "提示", "请先填写服务器地址和 Token")
+            return
+
+        self.cloud_test_btn.setEnabled(False)
+        self.cloud_test_btn.setText("测试中...")
+        backup_url = self.cloud_backup_url_edit.text().strip() if hasattr(self, "cloud_backup_url_edit") else ""
+
+        def do_test():
+            if backup_url:
+                from cloud_client import MultiCloudClient
+                client = MultiCloudClient([server_url, backup_url], auth_token)
+            else:
+                client = CloudClient(server_url, auth_token)
+            success, msg = client.test_connection()
+            self.cloud_test_btn.setEnabled(True)
+            self.cloud_test_btn.setText("测试 Cloud 连接")
+            if success:
+                self.cloud_status_label.setText(f"Cloud 状态: {msg}")
+                self.cloud_status_label.setStyleSheet("color: #27ae60;")
+                QMessageBox.information(self, "连接成功", msg)
+            else:
+                self.cloud_status_label.setText(f"Cloud 状态: 连接失败 - {msg[:50]}")
+                self.cloud_status_label.setStyleSheet("color: #e74c3c;")
+                QMessageBox.warning(self, "连接失败", msg)
+
+        from threading import Thread
+        Thread(target=do_test, daemon=True).start()
+
+    def _toggle_cloud_token_visibility(self, checked):
+        """切换 Cloud Token 显示/隐藏"""
+        if checked:
+            self.cloud_token_edit.setEchoMode(QLineEdit.Normal)
+            self.cloud_token_toggle_btn.setText("隐藏")
+        else:
+            self.cloud_token_edit.setEchoMode(QLineEdit.Password)
+            self.cloud_token_toggle_btn.setText("显示")
+
+    def _on_api_record(self, endpoint, http_status, latency, success, network_session_id=0):
+        self.api_history.current_session_id = network_session_id
+        self.api_history.record(endpoint, http_status, latency, success, network_session_id)
+        if success:
+            self.consecutive_success += 1
+            self.consecutive_failure = 0
+            self.last_success_time = time.time()
+        else:
+            self.consecutive_failure += 1
+            self.consecutive_success = 0
+            self.last_error_time = time.time()
+            self.last_error_msg = f"HTTP {http_status}"
+
+    def _on_status_update(self, status_data):
+        self.current_status = status_data
+
+        pickup_api = status_data.get("pickup_api_available")
+        if pickup_api is True:
+            self._update_card(self.pickup_card, "正常", "#27ae60")
+        elif pickup_api is False:
+            self._update_card(self.pickup_card, "异常", "#e74c3c")
+        else:
+            self._update_card(self.pickup_card, "检测中...", "#f39c12")
+
+        meta = status_data.get("meta", {})
+        last_check = meta.get("last_check")
+        if last_check:
+            self._update_card(self.last_update_card, datetime.fromtimestamp(last_check).strftime('%H:%M:%S'), "#2c3e50")
+
+        # 成功率
+        stats = self.api_history.get_stats(hours=1)
+        if stats and stats.get('total', 0) > 0:
+            rate = stats.get('success_rate', 0) * 100
+            self._update_card(self.success_rate_card, f"{rate:.0f}%", "#27ae60" if rate > 80 else "#f39c12")
+
+        # 次级技术信息
+        region_interval = status_data.get('pickup_region_interval', 15)
+        stagger = status_data.get('pickup_stagger', 5)
+        backoff_dict = status_data.get('pickup_backoff', {})
+        max_backoff = max(backoff_dict.values()) if backoff_dict else 0
+        backoff_text = f" | 退避: {max_backoff}秒" if max_backoff > 0 else ""
+        self.tech_info_label.setText(
+            f"区域轮询: {region_interval}秒 | 错峰: {stagger}秒{backoff_text} | "
+            f"累计检查: {meta.get('check_count', 0)} | "
+            f"连续成功: {self.consecutive_success} | 连续失败: {self.consecutive_failure}"
+        )
+
+        self._update_network_info()
+        self._update_store_table(status_data)
+        self._update_trends_local(status_data)
+        self._update_stats_panel()
+        self._update_china_control(status_data)
+        self._update_australia_control(status_data)
+        self._update_market_watch(status_data)
+
+    def _update_network_info(self):
+        """更新网络信息（带30秒缓存，避免每秒查询阻塞GUI）"""
+        now = time.time()
+        if hasattr(self, '_last_network_check') and now - self._last_network_check < 30:
+            return
+        self._last_network_check = now
+        try:
+            import urllib.request
+            ip = urllib.request.urlopen("https://api.ipify.org", timeout=3).read().decode()
+            # 查询 ISP（失败不影响监控）
+            isp = "未知"
+            try:
+                import json
+                req = urllib.request.Request(
+                    f"http://ip-api.com/json/{ip}?fields=isp,org",
+                    headers={"User-Agent": "iPhoneDuoMonitor/2.1"})
+                resp = urllib.request.urlopen(req, timeout=3)
+                data = json.loads(resp.read().decode())
+                isp = data.get("isp", "未知")
+            except:
+                pass
+            # 更新次级技术信息（追加到现有内容）
+            current = self.tech_info_label.text()
+            if "IP:" in current:
+                # 替换 IP 部分
+                import re
+                current = re.sub(r'IP: [^|]+', f'IP: {ip}', current)
+                current = re.sub(r'ISP: [^|]+', f'ISP: {isp}', current)
+                self.tech_info_label.setText(current)
+        except:
+            pass
+
+    def _update_store_table(self, status_data):
+        pickup_status = status_data.get("pickup_status", {})
+        enabled_skus = status_data.get("enabled_skus", [])
+        pickup_api_ok = status_data.get("pickup_api_available")
+
+        for row in range(self.store_table.rowCount()):
+            store_id_item = self.store_table.item(row, 2)
+            if not store_id_item:
+                continue
+            store_number = store_id_item.text()
+            store_data = pickup_status.get(store_number, {})
+
+            last_known_text = "无数据"
+            for col, sku in enumerate(enabled_skus):
+                sku_data = store_data.get("skus", {}).get(sku["id"], {})
+                available = sku_data.get("available")
+                item = QTableWidgetItem()
+
+                if pickup_api_ok is False:
+                    # API 不可用，显示未知（短横杠），无颜色
+                    item.setText("-")
+                    last_known = sku_data.get("last_known")
+                    if last_known is True:
+                        last_known_text = "最后已知: 有货"
+                    elif last_known is False:
+                        last_known_text = "最后已知: 无货"
+                elif available is True:
+                    item.setText("有货")
+                    item.setForeground(QColor("#f39c12"))  # 橙色
+                    last_known_text = "有货"
+                elif available is False:
+                    item.setText("无货")
+                    last_known_text = "无货"
+                else:
+                    item.setText("-")
+
+                item.setTextAlignment(Qt.AlignCenter)
+                self.store_table.setItem(row, 3 + col, item)
+
+            # 最后已知状态列
+            self.store_table.setItem(row, 3 + len(enabled_skus), QTableWidgetItem(last_known_text))
+
+            # 更新时间
+            last_checked = None
+            for sku in enabled_skus:
+                sku_data = store_data.get("skus", {}).get(sku["id"], {})
+                if sku_data.get("last_checked"):
+                    last_checked = sku_data["last_checked"]
+                    break
+            if last_checked:
+                time_str = datetime.fromtimestamp(last_checked).strftime("%H:%M:%S")
+                self.store_table.setItem(row, 4 + len(enabled_skus), QTableWidgetItem(time_str))
+
+    def _update_trends_local(self, status_data):
+        """本地模式下的供货趋势显示（简单统计，完整趋势需云端）"""
+        # 统计当前有货门店数
+        pickup_status = status_data.get("pickup_status", {})
+        available_stores = set()
+        for key, state in pickup_status.items():
+            if state.get("available") is True:
+                store_num = key.split("|")[-1] if "|" in key else key
+                available_stores.add(store_num)
+
+        total_stores = len(self.target_stores) if hasattr(self, 'target_stores') else 16
+        current = len(available_stores)
+
+        # 更新顶部卡片
+        self._update_card(self.trend_card, f"{current}/{total_stores}店", "#27ae60" if current > 0 else "#95a5a6")
+
+        # 更新趋势标签（本地模式只显示当前状态，历史趋势需云端）
+        self.trend_labels["current_stores"].setText(f"{current}/{total_stores}")
+        self.trend_labels["restock_1h"].setText("-")
+        self.trend_labels["restock_6h"].setText("-")
+        self.trend_labels["restock_24h"].setText("-")
+        self.trend_labels["last_restock"].setText("-")
+        self.trend_labels["active_city"].setText("-")
+
+        self.trend_pulse_label.setText("本地模式：完整供货趋势需云端运行")
+        self.trend_events_label.setText("本地模式：补货历史需云端记录")
+
+    def _update_stats_panel(self):
+        stats_1h = self.api_history.get_stats(hours=1)
+        stats_24h = self.api_history.get_stats(hours=24)
+        text = f"""=== API 请求统计 ===
+
+最近 1 小时:
+  总请求数: {stats_1h['total']}
+  HTTP 200: {stats_1h['rate_200']:.1f}%
+  HTTP 541: {stats_1h['rate_541']:.1f}%
+  平均响应: {stats_1h['avg_latency']:.2f} 秒
+
+最近 24 小时:
+  总请求数: {stats_24h['total']}
+  HTTP 200: {stats_24h['rate_200']:.1f}%
+  HTTP 541: {stats_24h['rate_541']:.1f}%
+  平均响应: {stats_24h['avg_latency']:.2f} 秒
+
+连续状态:
+  连续成功: {self.consecutive_success}
+  连续失败: {self.consecutive_failure}
+  最近成功: {datetime.fromtimestamp(self.last_success_time).strftime('%H:%M:%S') if self.last_success_time else '-'}
+  最近错误: {datetime.fromtimestamp(self.last_error_time).strftime('%H:%M:%S') if self.last_error_time else '-'} ({self.last_error_msg})
+
+注意: 仅记录技术信息（时间戳、端点、HTTP状态、延迟），不记录 Apple ID、Cookie、Token、Bark Key 等敏感信息。
+"""
+        self.stats_text.setPlainText(text)
+
+    def _update_china_control(self, status_data):
+        """更新 China Control 标签页"""
+        cc = status_data.get("china_control", {})
+        if not cc:
+            return
+
+        available = cc.get("available")
+        if available is True:
+            status_text = "有货"
+            color = "#2ecc71"
+        elif available is False:
+            status_text = "无货"
+            color = "#e74c3c"
+        else:
+            status_text = "未知（API不可用）"
+            color = "#f39c12"
+
+        last_success = cc.get("last_success")
+        last_success_str = datetime.fromtimestamp(last_success).strftime('%H:%M:%S') if last_success else "-"
+        last_error = cc.get("last_error") or "-"
+        http_status = cc.get("last_http_status") or "-"
+
+        self.china_status_label.setText(
+            f"状态: {status_text} | HTTP: {http_status} | "
+            f"最近成功: {last_success_str} | 连续成功: {cc.get('consecutive_success', 0)} | "
+            f"连续失败: {cc.get('consecutive_failure', 0)}\n"
+            f"最近错误: {last_error}"
+        )
+        self.china_status_label.setStyleSheet(f"color: {color};")
+
+        # 更新门店表
+        stores = cc.get("stores", {})
+        target_stores = []
+        if hasattr(self, 'monitor_worker') and self.monitor_worker and hasattr(self.monitor_worker, 'monitor'):
+            stores_dict = self.monitor_worker.monitor.stores
+            if isinstance(stores_dict, dict):
+                for region in stores_dict.get("regions", {}).values():
+                    target_stores.extend(region.get("stores", []))
+        elif hasattr(self, 'stores'):
+            if isinstance(self.stores, dict):
+                for region in self.stores.get("regions", {}).values():
+                    target_stores.extend(region.get("stores", []))
+            elif isinstance(self.stores, list):
+                target_stores = self.stores
+
+        self.china_control_table.setRowCount(len(target_stores))
+        for row, store in enumerate(target_stores):
+            sn = store.get("store_number", "")
+            store_state = stores.get(sn, {})
+            avail = store_state.get("available")
+            if avail is True:
+                cell_text = "有货"
+                cell_color = "#2ecc71"
+            elif avail is False:
+                cell_text = "无货"
+                cell_color = "#e74c3c"
+            else:
+                cell_text = "未知"
+                cell_color = "#f39c12"
+
+            self.china_control_table.setItem(row, 0, QTableWidgetItem(store.get("city", "")))
+            self.china_control_table.setItem(row, 1, QTableWidgetItem(store.get("name", "")))
+            self.china_control_table.setItem(row, 2, QTableWidgetItem(sn))
+            item = QTableWidgetItem(cell_text)
+            item.setForeground(QColor(cell_color))
+            self.china_control_table.setItem(row, 3, item)
+
+    def _update_australia_control(self, status_data):
+        """更新 Australia Control 标签页"""
+        ac = status_data.get("australia_control", {})
+        if not ac:
+            return
+
+        duo_avail = ac.get("duo_available")
+        ip18_avail = ac.get("iphone18_available")
+
+        def status_text(avail):
+            if avail is True: return "有货", "#2ecc71"
+            if avail is False: return "无货", "#e74c3c"
+            return "未知", "#f39c12"
+
+        duo_text, duo_color = status_text(duo_avail)
+        ip18_text, ip18_color = status_text(ip18_avail)
+        last_success = ac.get("last_success")
+        last_success_str = datetime.fromtimestamp(last_success).strftime('%H:%M:%S') if last_success else "-"
+
+        self.au_status_label.setText(
+            f"Duo: {duo_text} | iPhone 18 Pro: {ip18_text} | "
+            f"最近成功: {last_success_str} | 退避: {ac.get('backoff', 0)}秒"
+        )
+
+        # 更新门店表
+        stores = ac.get("stores", [])
+        self.au_table.setRowCount(len(stores))
+        for row, store in enumerate(stores):
+            self.au_table.setItem(row, 0, QTableWidgetItem(store.get("store_name", "")))
+            self.au_table.setItem(row, 1, QTableWidgetItem(store.get("store_number", "")))
+            duo_item = QTableWidgetItem(duo_text)
+            duo_item.setForeground(QColor(duo_color))
+            self.au_table.setItem(row, 2, duo_item)
+            ip18_item = QTableWidgetItem(ip18_text)
+            ip18_item.setForeground(QColor(ip18_color))
+            self.au_table.setItem(row, 3, ip18_item)
+
+    def _update_market_watch(self, status_data):
+        """更新 Market Watch 标签页"""
+        mw = status_data.get("market_watch", {})
+        if not mw:
+            return
+
+        stats = mw.get("stats", {})
+        sku_order = ["duo_512_starlight", "duo_512_midnight", "duo_1tb_starlight", "duo_1tb_midnight"]
+        self.mw_table.setRowCount(len(sku_order))
+
+        for row, sku_id in enumerate(sku_order):
+            s = stats.get(sku_id, {})
+            self.mw_table.setItem(row, 0, QTableWidgetItem(s.get("name", "")))
+            self.mw_table.setItem(row, 1, QTableWidgetItem(f"¥{s.get('official_price', '-')}"))
+            self.mw_table.setItem(row, 2, QTableWidgetItem(f"¥{s.get('current_min', '-')}" if s.get('current_min') else "-"))
+            self.mw_table.setItem(row, 3, QTableWidgetItem(f"¥{s.get('current_median', '-')}" if s.get('current_median') else "-"))
+            self.mw_table.setItem(row, 4, QTableWidgetItem(f"¥{s.get('current_avg', '-')}" if s.get('current_avg') else "-"))
+            premium = s.get('premium_amount')
+            premium_text = f"+¥{premium}" if premium is not None else "-"
+            self.mw_table.setItem(row, 5, QTableWidgetItem(premium_text))
+            premium_pct = s.get('premium_percent')
+            pct_text = f"+{premium_pct}%" if premium_pct is not None else "-"
+            self.mw_table.setItem(row, 6, QTableWidgetItem(pct_text))
+            self.mw_table.setItem(row, 7, QTableWidgetItem(str(s.get('sample_count', 0))))
+
+    def _add_market_sample(self):
+        """手动添加二级市场报价"""
+        sku_names = ["duo_512_starlight", "duo_512_midnight", "duo_1tb_starlight", "duo_1tb_midnight"]
+        sku_idx = self.mw_sku_combo.currentIndex()
+        sku_id = sku_names[sku_idx]
+        try:
+            price = float(self.mw_price_input.text())
+        except ValueError:
+            self._append_log("Market Watch: 价格格式错误")
+            return
+
+        if hasattr(self, 'monitor_worker') and self.monitor_worker and hasattr(self.monitor_worker, 'market_watch'):
+            success = self.monitor_worker.market_watch.add_manual_sample(sku_id, price)
+            if success:
+                self._append_log(f"Market Watch: 已添加 {sku_id} ¥{price}")
+                self.mw_price_input.clear()
+            else:
+                self._append_log(f"Market Watch: 价格无效（¥{price}），已拒绝")
+        else:
+            self._append_log("Market Watch: 监控未启动，无法添加")
+
+    def _on_log_message(self, msg):
+        self._append_log(msg)
+
+    def _append_log(self, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {msg}")
+        if self.log_text.document().blockCount() > 500:
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(cursor.Start)
+            cursor.select(cursor.LineUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+
+    def _on_alert(self, alerts):
+        checkout_hits = []
+        for alert in alerts:
+            if alert["type"] == "pickup":
+                sku_id = alert["sku_id"]
+                store_number = alert["store_number"]
+                detail = alert.get("detail", {})
+                sku_info = next((s for s in self.all_skus if s["id"] == sku_id), {})
+                msg = f"有货! {sku_info.get('capacity', '')} {sku_info.get('color', '')} @ {detail.get('store_name', store_number)}"
+                self._append_log(f"*** 报警: {msg} ***")
+                self.tray_icon.showMessage(
+                    "iPhone Duo 有货!",
+                    f"{sku_info.get('capacity', '')} {sku_info.get('color', '')}\n{detail.get('store_name', store_number)}\n{detail.get('pickup_search_quote', '')}",
+                    QSystemTrayIcon.Information, 10000)
+                # 触发 Checkout Assistant（如果启用；本轮所有报警合并为一个 wave）
+                if self.checkout.enabled:
+                    checkout_hits.append({
+                        "sku_id": sku_id,
+                        "part_number": sku_info.get("part_number", ""),
+                        "sku_name": sku_info.get("name", ""),
+                        "capacity": sku_info.get("capacity", ""),
+                        "color": sku_info.get("color", ""),
+                        "store_number": store_number,
+                        "store_name": detail.get("store_name", store_number),
+                        "city": detail.get("city", ""),
+                    })
+            elif alert["type"] == "delivery":
+                sku_id = alert["sku_id"]
+                detail = alert.get("detail", {})
+                sku_info = next((s for s in self.all_skus if s["id"] == sku_id), {})
+                self._append_log(f"*** 报警: 配送有货! {sku_info.get('capacity', '')} {sku_info.get('color', '')} ***")
+                if self.checkout.enabled:
+                    checkout_hits.append({
+                        "sku_id": sku_id,
+                        "part_number": sku_info.get("part_number", ""),
+                        "sku_name": sku_info.get("name", ""),
+                        "capacity": sku_info.get("capacity", ""),
+                        "color": sku_info.get("color", ""),
+                        "store_number": "",
+                        "store_name": "官网配送",
+                        "city": "",
+                    })
+        if checkout_hits:
+            self._run_checkout_assistant(checkout_hits)
+
+    def _on_interval_changed(self, value):
+        if self.monitor_worker:
+            self.monitor_worker.update_interval(value)
+        self._append_log(f"轮询间隔已更新为 {value} 秒")
+
+    def _toggle_test_mode(self, state):
+        self.test_mode = (state == Qt.Checked.value)
+        self.test_mode_banner.setVisible(self.test_mode)
+        self.trigger_test_btn.setEnabled(self.test_mode)
+        if self.monitor_worker:
+            self.monitor_worker.test_mode = self.test_mode
+        self._append_log(f"Test Mode: {'已启用' if self.test_mode else '已关闭'}")
+
+    def _trigger_test_alert(self):
+        if self.monitor_worker:
+            self.monitor_worker.trigger_test_alert()
+
+    def _test_pickup_api(self):
+        self._append_log("手动测试 Pickup API...")
+        QTimer.singleShot(100, lambda: self._run_api_test("pickup"))
+
+    def _test_delivery_api(self):
+        self._append_log("手动测试 Delivery API...")
+        QTimer.singleShot(100, lambda: self._run_api_test("delivery"))
+
+    def _run_api_test(self, api_type):
+        try:
+            from apple_api import AppleCNAPI
+            api = AppleCNAPI(self.config)
+            if api_type == "pickup":
+                stores, _ = api.check_pickup_availability(["MK2P4CH/A"], "200000")
+                self._append_log(f"Pickup API 测试成功，返回 {len(stores)} 家门店")
+            else:
+                result = api.check_delivery_availability(["MK2P4CH/A"], "200000")
+                self._append_log(f"Delivery API 测试成功")
+        except Exception as e:
+            self._append_log(f"API 测试失败: {e}")
+
+    def _test_macos_notification(self):
+        self.tray_icon.showMessage("测试通知", "这是一条测试通知，macOS 通知功能正常。",
+                                   QSystemTrayIcon.Information, 3000)
+        self._append_log("已发送测试 macOS 通知")
+
+    def _test_sound(self):
+        try:
+            subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], timeout=5)
+            self._append_log("已播放测试声音")
+        except Exception as e:
+            self._append_log(f"播放声音失败: {e}")
+
+    def _toggle_bark_visibility(self, checked):
+        """切换 Bark Key 显示/隐藏"""
+        if checked:
+            self.bark_key_edit.setEchoMode(QLineEdit.Normal)
+            self.bark_toggle_btn.setText("隐藏")
+        else:
+            self.bark_key_edit.setEchoMode(QLineEdit.Password)
+            self.bark_toggle_btn.setText("显示")
+
+    def _test_bark(self):
+        bark_url = self.bark_key_edit.text().strip()
+        if not bark_url:
+            self._append_log("Bark Key 未配置")
+            return
+        try:
+            import urllib.request
+            url = f"{bark_url}/测试通知/iPhone Duo 库存监控测试"
+            urllib.request.urlopen(url, timeout=5)
+            self._append_log("Bark 测试推送已发送")
+        except Exception as e:
+            self._append_log(f"Bark 测试失败: {e}")
+
+    def _open_log_dir(self):
+        log_dir = os.path.join(DATA_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        subprocess.run(["open", log_dir])
+
+    def _refresh_diagnostics(self):
+        """刷新 Diagnostics 标签页数据（v1.5.0）"""
+        try:
+            if not hasattr(self.worker, 'diagnostics') or not self.worker.diagnostics:
+                return
+            data = self.worker.diagnostics.get_dashboard_data()
+
+            # 更新会话信息
+            session = data.get("session", {})
+            self.diag_session_label.setText(
+                f"Session: {session.get('session_id', '-')} | "
+                f"IP: {session.get('public_ip', '-')} | "
+                f"ISP: {session.get('isp', '-')}"
+            )
+
+            # 更新对比表格
+            modules = [
+                data.get("app_stats", {}),
+                data.get("sentinel_a", {}),
+                data.get("sentinel_b", {}),
+            ]
+            for row, stats in enumerate(modules):
+                if stats:
+                    self.diag_compare_table.setItem(row, 1, QTableWidgetItem(str(stats.get("total", 0))))
+                    self.diag_compare_table.setItem(row, 2, QTableWidgetItem(str(stats.get("stats", {}).get("200", 0))))
+                    self.diag_compare_table.setItem(row, 3, QTableWidgetItem(str(stats.get("stats", {}).get("541", 0))))
+                    self.diag_compare_table.setItem(row, 4, QTableWidgetItem(f"{stats.get('success_rate', 0)}%"))
+                    self.diag_compare_table.setItem(row, 5, QTableWidgetItem(str(stats.get("consecutive_541", 0))))
+
+            # 更新 DIVERGENCE EVENTS
+            events = data.get("divergence_events", [])
+            if events:
+                event_text = "\n".join([
+                    f"[{e.get('timestamp', '')}] {e.get('type', '')}: "
+                    f"App={e.get('app_status', '')}, "
+                    f"SA={e.get('sentinel_a_status', '')}, "
+                    f"SB={e.get('sentinel_b_status', '')}"
+                    for e in events
+                ])
+                self.diag_divergence_text.setText(event_text)
+            else:
+                self.diag_divergence_text.setText("暂无分叉事件")
+
+        except Exception as e:
+            self.diag_divergence_text.setText(f"刷新失败: {e}")
+
+    def _generate_diag_summary(self):
+        """生成晨间摘要（v1.5.0）"""
+        try:
+            if not hasattr(self.worker, 'diagnostics') or not self.worker.diagnostics:
+                QMessageBox.warning(self, "提示", "诊断模块未启动")
+                return
+            summary = self.worker.diagnostics.generate_morning_summary()
+            self.diag_divergence_text.setText(summary)
+            QMessageBox.information(self, "晨间摘要", "摘要已生成并写入 diagnostics_summary.log")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"生成摘要失败: {e}")
+
+    def _export_diagnostic_report(self):
+        report = f"""=== iPhone Duo 库存监控 诊断报告 ===
+生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+软件版本: {APP_VERSION}
+开发者: {DEVELOPER_NAME}
+
+=== 系统信息 ===
+macOS: {platform.mac_ver()[0]}
+架构: {platform.machine()}
+Python: {platform.python_version()}
+
+=== 网络信息 ===
+公网 IP: {self.tech_info_label.text().split('IP:')[1].split('|')[0].strip() if 'IP:' in self.tech_info_label.text() else '-'}
+网络状态: {self.cloud_card.value_label.text() if hasattr(self, 'cloud_card') else '-'}
+
+=== API 状态 ===
+Pickup API: {self.pickup_card.value_label.text() if hasattr(self, 'pickup_card') else '-'}
+供货趋势: {self.trend_card.value_label.text() if hasattr(self, 'trend_card') else '-'}
+连续成功: {self.consecutive_success}
+连续失败: {self.consecutive_failure}
+累计检查: {getattr(self, '_check_count', 0)}
+
+=== API 统计（最近1小时）===
+{json.dumps(self.api_history.get_stats(hours=1), indent=2)}
+
+=== SKU 配置 ===
+"""
+        for sku in self.all_skus:
+            report += f"  {sku['part_number']}: {sku['name']} (enabled={sku.get('enabled')})\n"
+
+        report += "\n=== 门店配置 ===\n"
+        for sn in get_all_store_numbers(self.stores):
+            info = self.store_map.get(sn, {})
+            report += f"  {sn}: {info.get('name', '')} ({info.get('city', '')})\n"
+
+        report += f"\n=== 最近错误 ===\n{self.last_error_msg or '无'}\n"
+        report += "\n注意: 本报告不包含 Bark Key、Apple ID、Cookie、Token、地址、电话等敏感信息。\n"
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出诊断报告",
+                                                    f"diagnostic_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                                    "Text Files (*.txt)")
+        if file_path:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(report)
+            self._append_log(f"诊断报告已导出: {file_path}")
+
+    def _toggle_checkout(self, state):
+        self.checkout.enabled = (state == Qt.Checked.value)
+        self._append_log(f"Checkout Assistant: {'已启用' if self.checkout.enabled else '已关闭'}")
+        self._update_checkout_state()
+        self._persist_checkout_config()
+
+    def _on_checkout_option_changed(self, _state=None):
+        self.checkout.auto_open_page = self.checkout_auto_open_cb.isChecked()
+        self.checkout.auto_select_store = self.checkout_auto_select_cb.isChecked()
+        self.checkout.auto_add_to_cart = self.checkout_auto_cart_cb.isChecked()
+        self.checkout.auto_fill_details = self.checkout_auto_fill_cb.isChecked()
+        self.checkout.auto_start_checkout = self.checkout_auto_checkout_cb.isChecked()
+        self._persist_checkout_config()
+        self._update_checkout_state()
+
+    def _on_checkout_priority_changed(self, *_):
+        self.checkout.priority_tier1 = self.checkout._as_store_list(self.checkout_tier1_edit.text(), [])
+        self.checkout.priority_tier2 = [x for x in self.checkout._as_store_list(self.checkout_tier2_edit.text(), [])
+                                        if x not in self.checkout.priority_tier1]
+        self.checkout.open_only_priority = self.checkout_only_priority_cb.isChecked()
+        self.checkout.quiet_hours = self.checkout._as_quiet_hours(self.checkout_quiet_edit.text())
+        self.checkout_quiet_edit.setText(self.checkout.quiet_hours)
+        self.checkout_tier1_edit.setText(", ".join(self.checkout.priority_tier1))
+        self.checkout_tier2_edit.setText(", ".join(self.checkout.priority_tier2))
+        self._persist_checkout_config()
+        self._update_checkout_state()
+        if hasattr(self, "checkout_prio_status"):
+            self.checkout_prio_status.setText(
+                f"已保存 {datetime.now().strftime('%H:%M:%S')} · 一级 {'/'.join(self.checkout.priority_tier1) or '-'} · "
+                f"二级 {'/'.join(self.checkout.priority_tier2) or '-'} · 静音 {self.checkout.quiet_hours or '无'}")
+            self.checkout_prio_status.setStyleSheet("color: #27ae60; font-weight: bold;")
+
+    def _on_checkout_browser_changed(self, _index=None):
+        self.checkout.browser = self.checkout_browser_combo.currentData() or "default"
+        self._append_log(f"Checkout Assistant: 打开方式 = {self.checkout.browser}")
+        self._persist_checkout_config()
+        self._update_checkout_state()
+
+    def _persist_checkout_config(self):
+        """把 Checkout 开关写入 config.json 的 checkout 段（仅本机配置；首次安装默认 enabled=false）"""
+        config_path = os.path.join(self.config_dir, "config.json")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            config["checkout"] = self.checkout.to_config()
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            self.config["checkout"] = config["checkout"]
+        except Exception as e:
+            self._append_log(f"[Checkout] 保存配置失败: {e}")
+
+    def _update_checkout_state(self):
+        info = self.checkout.get_state_info()
+        self.checkout_state_label.setText(f"状态: {info['state']}")
+        self.checkout_sku_label.setText(f"当前 SKU: {info.get('current_sku') or '-'}")
+        self.checkout_store_label.setText(f"当前门店: {info.get('current_store') or '-'}")
+        self._update_armed_label()
+
+    def _save_checkout_profile(self):
+        profile = {
+            "name": self.profile_name_edit.text().strip(),
+            "phone": self.profile_phone_edit.text().strip(),
+            "address": self.profile_address_edit.text().strip(),
+        }
+        self.checkout.save_profile(profile)
+        self._append_log("收货资料已保存（仅本机，已过滤敏感字段）")
+        if hasattr(self, "checkout_profile_status"):
+            self.checkout_profile_status.setText(f"已保存 {datetime.now().strftime('%H:%M:%S')}（当前版本未使用这份资料）")
+            self.checkout_profile_status.setStyleSheet("color: #27ae60;")
+
+    def _clear_checkout_profile(self):
+        self.checkout.clear_profile()
+        self.profile_name_edit.clear()
+        self.profile_phone_edit.clear()
+        self.profile_address_edit.clear()
+        self._append_log("收货资料已清除")
+        if hasattr(self, "checkout_profile_status"):
+            self.checkout_profile_status.setText(f"已清除 {datetime.now().strftime('%H:%M:%S')}")
+            self.checkout_profile_status.setStyleSheet("color: #7f8c8d;")
+
+    def _save_settings(self):
+        config_path = os.path.join(self.config_dir, "config.json")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            config["monitor"]["interval_seconds"] = self.interval_spin.value()
+            config["notification"]["macos_notification"] = self.macos_notify_cb.isChecked()
+            config["notification"]["sound"] = self.sound_cb.isChecked()
+            config["notification"]["auto_open_buy_page"] = self.auto_open_cb.isChecked()
+            config["notification"]["bark"]["enabled"] = self.bark_enabled_cb.isChecked()
+            config["notification"]["bark"]["url"] = self.bark_key_edit.text()
+            config["checkout"] = self.checkout.to_config()
+            self.checkout.set_bark_config(config["notification"]["bark"])
+            self._update_armed_label()
+            # v2.0: Cloud 配置
+            if "cloud" not in config:
+                config["cloud"] = {}
+            new_cloud_enabled = self.cloud_enabled_cb.isChecked()
+            config["cloud"]["enabled"] = new_cloud_enabled
+            config["cloud"]["server_url"] = self.cloud_url_edit.text()
+            config["cloud"]["backup_server_url"] = self.cloud_backup_url_edit.text().strip()
+            config["cloud"]["auth_token"] = self.cloud_token_edit.text()
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            self._append_log("设置已保存")
+
+            new_urls = (self.cloud_url_edit.text().strip(), self.cloud_backup_url_edit.text().strip())
+            if new_cloud_enabled == self.cloud_mode and new_cloud_enabled and self.cloud_client \
+                    and new_urls != getattr(self, "_cloud_active_urls", None):
+                # 地址变化：按新的主/备地址重新连接
+                self._stop_cloud_mode()
+                self._cloud_last_inventory = {}
+                self._start_cloud_mode()
+                QMessageBox.information(self, "设置已保存", "已按新的服务器地址重新连接 Cloud。")
+            # 如果 Cloud 模式变化，立即切换
+            elif new_cloud_enabled != self.cloud_mode:
+                self.cloud_mode = new_cloud_enabled
+                if new_cloud_enabled:
+                    # 切换到 Cloud 模式
+                    self.stop_monitoring()
+                    self._start_cloud_mode()
+                    QMessageBox.information(self, "设置已保存", "已切换到 Cloud 模式。")
+                else:
+                    # 切换到本地模式
+                    self._stop_cloud_mode()
+                    self.start_monitoring()
+                    QMessageBox.information(self, "设置已保存", "已切换到本地模式。")
+            else:
+                QMessageBox.information(self, "设置已保存", "设置已保存。")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"保存设置失败: {e}")
+
+    def closeEvent(self, event):
+        if self.tray_icon.isVisible():
+            self.hide()
+            event.ignore()
+            self.tray_icon.showMessage("iPhone Duo 库存监控", "程序已最小化到菜单栏，继续后台监控",
+                                       QSystemTrayIcon.Information, 2000)
+        else:
+            event.accept()
+
+    def quit_app(self):
+        self.stop_monitoring()
+        self._stop_cloud_mode()
+        self.tray_icon.hide()
+        QApplication.quit()
+
+
+def main():
+    # v1.4.0: 初始化日志到用户数据目录
+    from monitor import setup_logging
+    from config_loader import load_config
+    try:
+        config, _, _ = load_config(CONFIG_DIR)
+    except Exception:
+        config = {}
+    setup_logging(config, log_dir=os.path.join(DATA_DIR, "logs"))
+    logging.getLogger(__name__).info("GUI 启动，日志目录: %s", os.path.join(DATA_DIR, "logs"))
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("iPhoneDuoMonitor")
+    app.setQuitOnLastWindowClosed(False)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

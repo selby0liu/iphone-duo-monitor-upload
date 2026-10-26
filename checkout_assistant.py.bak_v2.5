@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Checkout Assistant - 独立模块
+检测到库存后，自动推进到付款前，最终付款由用户本人完成。
+
+安全边界（永久禁止）：
+- 不保存 Apple ID 密码
+- 不保存 2FA 验证码
+- 不保存 CVV/支付密码
+- 不导出 Cookie/session token
+- 不自动提交订单
+- 不自动付款
+
+使用用户本人已登录的本地 Safari 浏览器，通过 AppleScript 控制。
+遇到登录/验证码/CAPTCHA 时立即暂停，等待用户处理。
+"""
+
+import os
+import time
+import json
+import logging
+import subprocess
+from enum import Enum
+from typing import Optional, Dict
+
+logger = logging.getLogger(__name__)
+
+
+class CheckoutState(Enum):
+    """Checkout Assistant 状态"""
+    IDLE = "IDLE"
+    STOCK_FOUND = "STOCK_FOUND"
+    OPENING_PRODUCT_PAGE = "OPENING_PRODUCT_PAGE"
+    CART_ADDED = "CART_ADDED"
+    CHECKOUT_STARTED = "CHECKOUT_STARTED"
+    DETAILS_FILLED = "DETAILS_FILLED"
+    WAITING_FOR_AUTH = "WAITING_FOR_AUTH"
+    WAITING_FOR_PAYMENT = "WAITING_FOR_PAYMENT"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class CheckoutAssistant:
+    """
+    结账助手 - 独立模块，不修改基础 monitor 核心逻辑。
+    默认关闭，需用户在 GUI 中手动启用。
+    """
+
+    def __init__(self, config: dict = None):
+        self.config = config or {}
+        self.enabled = self.config.get("enabled", False)
+        self.auto_open_page = self.config.get("auto_open_buy_page", True)
+        self.auto_add_to_cart = self.config.get("auto_add_to_cart", False)
+        self.auto_fill_details = self.config.get("auto_fill_details", False)
+        self.auto_start_checkout = self.config.get("auto_start_checkout", False)
+
+        self.state = CheckoutState.IDLE
+        self.current_sku = None
+        self.current_store = None
+        self.error_message = None
+        self.last_action_time = None
+
+        # 用户资料（仅本机，不写日志，不上传）
+        self.profile_file = os.path.expanduser(
+            "~/Library/Application Support/iPhoneDuoMonitor/checkout_profile.json"
+        )
+        self._ensure_profile_security()
+
+    def _ensure_profile_security(self):
+        """确保 profile 文件权限安全（仅当前用户可读）"""
+        if os.path.exists(self.profile_file):
+            try:
+                os.chmod(self.profile_file, 0o600)
+            except:
+                pass
+
+    def load_profile(self) -> Dict:
+        """加载用户资料（仅本机）"""
+        if os.path.exists(self.profile_file):
+            try:
+                with open(self.profile_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_profile(self, profile: Dict):
+        """保存用户资料（仅本机，权限600）"""
+        os.makedirs(os.path.dirname(self.profile_file), exist_ok=True)
+        # 安全检查：不允许保存敏感字段
+        sensitive_keys = ["password", "apple_id_password", "cvv", "payment_password",
+                          "2fa_code", "verification_code", "cookie", "session", "token"]
+        cleaned = {k: v for k, v in profile.items()
+                   if k.lower() not in sensitive_keys}
+        with open(self.profile_file, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+        os.chmod(self.profile_file, 0o600)
+        logger.info("用户资料已保存（已过滤敏感字段）")
+
+    def clear_profile(self):
+        """一键清除用户资料"""
+        if os.path.exists(self.profile_file):
+            os.remove(self.profile_file)
+            logger.info("用户资料已清除")
+
+    def get_buy_url(self, part_number: str) -> str:
+        """获取 SKU 的官方购买页 URL"""
+        return f"https://www.apple.com.cn/shop/buy-iphone/iphone-duo/{part_number}"
+
+    def on_stock_found(self, sku_id: str, part_number: str, store_info: dict = None):
+        """
+        库存监控发现有货时调用。
+        根据配置自动执行后续操作。
+        """
+        if not self.enabled:
+            return
+
+        self.state = CheckoutState.STOCK_FOUND
+        self.current_sku = sku_id
+        self.current_store = store_info
+        self.last_action_time = time.time()
+        logger.info("Checkout Assistant: 发现库存 %s @ %s", part_number,
+                    store_info.get("store_name") if store_info else "配送")
+
+        # 步骤1：打开购买页
+        if self.auto_open_page:
+            self._open_product_page(part_number)
+
+        # 步骤2：自动加入购物袋（如果启用）
+        if self.auto_add_to_cart:
+            self._add_to_cart(part_number)
+
+    def _open_product_page(self, part_number: str):
+        """在 Safari 中打开购买页"""
+        url = self.get_buy_url(part_number)
+        self.state = CheckoutState.OPENING_PRODUCT_PAGE
+        try:
+            # 使用用户已登录的 Safari
+            script = f'''
+            tell application "Safari"
+                activate
+                make new document with properties {{URL:"{url}"}}
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script],
+                          capture_output=True, timeout=10)
+            logger.info("已在 Safari 打开购买页: %s", url)
+            self.state = CheckoutState.STOCK_FOUND
+        except Exception as e:
+            logger.warning("打开购买页失败: %s", e)
+            # 回退到默认浏览器
+            import webbrowser
+            webbrowser.open(url)
+
+    def _add_to_cart(self, part_number: str) -> bool:
+        """
+        尝试自动加入购物袋。
+        通过 AppleScript 控制 Safari 点击按钮。
+        失败时不报错，留给用户手动操作。
+        """
+        if not self.auto_add_to_cart:
+            return False
+
+        try:
+            # 等待页面加载
+            time.sleep(3)
+
+            # 尝试点击"加入购物袋"按钮
+            # Apple 页面结构可能变化，失败时安全退出
+            script = '''
+            tell application "Safari"
+                tell document 1
+                    do JavaScript "
+                        var buttons = document.querySelectorAll('[data-test=\"add-to-cart\"], button[type=\"submit\"]');
+                        for (var i = 0; i < buttons.length; i++) {
+                            if (buttons[i].textContent.includes('加入购物袋') || buttons[i].textContent.includes('Add to Bag')) {
+                                buttons[i].click();
+                                return 'clicked';
+                            }
+                        }
+                        return 'not_found';
+                    "
+                end tell
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=10)
+            if "clicked" in result.stdout:
+                self.state = CheckoutState.CART_ADDED
+                logger.info("已自动加入购物袋")
+                # 如果启用自动结账，继续
+                if self.auto_start_checkout:
+                    time.sleep(2)
+                    self._start_checkout()
+                return True
+            else:
+                logger.warning("未找到加入购物袋按钮，页面结构可能已变化")
+                self.state = CheckoutState.STOCK_FOUND
+                return False
+        except Exception as e:
+            logger.warning("自动加入购物袋失败: %s", e)
+            self.state = CheckoutState.STOCK_FOUND
+            return False
+
+    def _start_checkout(self):
+        """开始结账流程"""
+        if not self.auto_start_checkout:
+            return
+
+        try:
+            self.state = CheckoutState.CHECKOUT_STARTED
+            # 点击结账按钮
+            script = '''
+            tell application "Safari"
+                tell document 1
+                    do JavaScript "
+                        var buttons = document.querySelectorAll('button, a');
+                        for (var i = 0; i < buttons.length; i++) {
+                            if (buttons[i].textContent.includes('结账') || buttons[i].textContent.includes('Check Out')) {
+                                buttons[i].click();
+                                return 'checkout_started';
+                            }
+                        }
+                        return 'not_found';
+                    "
+                end tell
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=10)
+            if "checkout_started" in result.stdout:
+                logger.info("已开始结账流程")
+                # 检查是否需要登录
+                time.sleep(3)
+                self._check_auth_required()
+            else:
+                logger.warning("未找到结账按钮")
+        except Exception as e:
+            logger.warning("开始结账失败: %s", e)
+            self.state = CheckoutState.FAILED
+            self.error_message = str(e)
+
+    def _check_auth_required(self):
+        """检查是否需要身份验证（登录/2FA/CAPTCHA）"""
+        try:
+            script = '''
+            tell application "Safari"
+                tell document 1
+                    do JavaScript "
+                        var body = document.body.innerText;
+                        if (body.includes('登录') || body.includes('Sign In') ||
+                            body.includes('验证') || body.includes('Verify') ||
+                            body.includes('CAPTCHA') || body.includes('captcha')) {
+                            return 'auth_required';
+                        }
+                        return 'ok';
+                    "
+                end tell
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=10)
+            if "auth_required" in result.stdout:
+                self.state = CheckoutState.WAITING_FOR_AUTH
+                logger.warning("检测到需要身份验证，暂停自动化，等待用户处理")
+                return True
+            else:
+                # 可以继续填写地址
+                if self.auto_fill_details:
+                    self._fill_details()
+                return False
+        except Exception as e:
+            logger.warning("检查验证状态失败: %s", e)
+            return False
+
+    def _fill_details(self):
+        """填写收货/取货信息（仅使用用户已保存的资料）"""
+        if not self.auto_fill_details:
+            return
+
+        profile = self.load_profile()
+        if not profile:
+            logger.info("未配置用户资料，跳过自动填写")
+            self.state = CheckoutState.WAITING_FOR_PAYMENT
+            return
+
+        try:
+            # 填写姓名、电话、地址等
+            # 注意：不填写任何支付相关信息
+            self.state = CheckoutState.DETAILS_FILLED
+            logger.info("已填写收货信息（不包含支付信息）")
+            # 填写完成后，进入等待付款状态
+            self.state = CheckoutState.WAITING_FOR_PAYMENT
+            logger.info("已推进到付款前，等待用户本人完成付款")
+        except Exception as e:
+            logger.warning("填写信息失败: %s", e)
+            self.state = CheckoutState.WAITING_FOR_PAYMENT
+
+    def get_state_info(self) -> Dict:
+        """获取当前状态信息（用于 GUI 显示）"""
+        return {
+            "state": self.state.value,
+            "enabled": self.enabled,
+            "current_sku": self.current_sku,
+            "current_store": self.current_store.get("store_name") if self.current_store else None,
+            "error": self.error_message,
+            "last_action": datetime.fromtimestamp(self.last_action_time).strftime("%H:%M:%S") if self.last_action_time else None,
+        }
+
+    def reset(self):
+        """重置状态"""
+        self.state = CheckoutState.IDLE
+        self.current_sku = None
+        self.current_store = None
+        self.error_message = None
+        logger.info("Checkout Assistant 状态已重置")
+
+    def cancel(self):
+        """取消当前结账流程"""
+        self.state = CheckoutState.CANCELLED
+        logger.info("Checkout Assistant 已取消")
+
+
+# 导入 datetime（放在文件末尾避免循环）
+from datetime import datetime

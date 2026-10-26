@@ -1,0 +1,422 @@
+/*
+ * iPhone Duo Monitor - 取货门店助手（content script）v1.1
+ *
+ * 流程：读 URL 片段里的候选门店 → 自动点一次“查看供货情况” → 等 Apple 自己把取货门店列表
+ * 渲染出来 → 选中当前仍然可选的最高优先门店 → 停下，等你人工继续。
+ *
+ * 永久禁止（本文件不包含、也不允许添加任何这些能力）：
+ *   - 不发任何网络请求：没有 fetch / XMLHttpRequest / sendBeacon / WebSocket / EventSource
+ *   - 不调用 fulfillment-messages、pickup-message 或任何 Apple 库存接口（只让页面自己去调）
+ *   - 不读写 cookie / localStorage / sessionStorage / IndexedDB
+ *   - 不读取 Apple ID、密码、验证码、付款信息，不导出任何东西
+ *   - 不操作 Apple 的 Redux / React 内部状态（content script 在隔离世界，本来也碰不到页面 JS）
+ *   - 不点“继续”、不加入购物袋、不结账、不下单、不付款
+ *   - 不刷新页面、不无限重试：一次页面加载只跑一轮，超时就停
+ *
+ * 只允许点两类元素，且都要过 safeClick 的白名单校验：
+ *   1) 取货门店单选框 input[type=radio][name^="store-"]
+ *   2) 打开供货情况弹窗的那个触发器（必须是 button[type=button] / 锚点 href="#" / role=button）
+ * 其它任何元素一律拒绝点击。
+ *
+ * 权限：manifest 里没有 permissions / host_permissions，只有一条
+ * content_scripts.matches = https://www.apple.com.cn/shop/*（由浏览器强制，脚本进不了别的站点）。
+ */
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------- 常量
+  var FRAGMENT_KEY = "duomonitor-stores";
+  var STORE_RE = /^R[0-9A-Z]{2,7}$/;
+  var MAX_CANDIDATES = 8;
+  var RADIO_SELECTOR = 'input[type="radio"][name^="store-"]';
+
+  // 改成 false 就只被动等门店列表、不主动点“查看供货情况”
+  var AUTO_OPEN_PICKUP_PANEL = true;
+  // 开局先安静这么久：如果页面自己就会把取货门店列表渲染出来（例如已保存过取货地点），
+  // 就不必去点“查看供货情况”，也就少让页面发一次供货查询。
+  var TRIGGER_INITIAL_DELAY_MS = 1200;
+  // 触发器最多点这么多次，且两次之间至少隔 TRIGGER_RETRY_MS；弹窗一旦打开就不再点
+  var MAX_TRIGGER_CLICKS = 3;
+  var TRIGGER_RETRY_MS = 1500;
+
+  // 等门店列表出现的上限（毫秒）。超过就显示“请手动操作”并彻底停止。
+  // 想给自己留更多时间手点“查看供货情况”，就改这一行的数字。
+  var PANEL_TIMEOUT_MS = 15000;
+  // 门店列表首次出现后，再给它这么久把剩下的门店渲染完，然后才判定“候选都不可选”
+  var PANEL_SETTLE_MS = 1500;
+  var POLL_MS = 200;
+
+  // 供货情况弹窗的触发器：先按选择器找，找不到再按按钮文字找
+  var TRIGGER_SELECTORS = [
+    ".rf-pickup-quote-overlay-trigger",
+    '[data-autom="pickup-quote-overlay-trigger"]',
+    '[data-autom="availabilityButton"]'
+  ];
+  var TRIGGER_TEXT = ["查看供货情况", "查看门店供货情况", "检查供货情况"];
+  var TRIGGER_TEXT_MAX = 40;
+
+  // 红线：文字或 data-autom 命中任意一条的元素，永远不点
+  var FORBIDDEN_TEXT = ["继续", "加入购物袋", "加入购物车", "立即购买", "结账", "去结账",
+    "付款", "支付", "下单", "提交订单", "Continue", "Add to Bag", "Add to Cart",
+    "Check Out", "Checkout", "Buy", "Place Order", "Pay"];
+  var FORBIDDEN_AUTOM = ["continuePickUp", "add-to-cart", "addToBag", "checkout",
+    "proceed", "buy", "placeOrder"];
+
+  /*
+   * 测试注入点。content script 运行在隔离世界，apple.com.cn 的页面脚本写不进这个对象，
+   * 所以线上永远取不到 override；只有本地测试页直接 <script src="content.js"> 时才生效。
+   */
+  var T = (typeof globalThis !== "undefined" && globalThis.__DUOMONITOR_TEST__) || {};
+  if (typeof T.panelTimeoutMs === "number") { PANEL_TIMEOUT_MS = T.panelTimeoutMs; }
+  if (typeof T.settleMs === "number") { PANEL_SETTLE_MS = T.settleMs; }
+  if (typeof T.pollMs === "number") { POLL_MS = T.pollMs; }
+  if (typeof T.triggerRetryMs === "number") { TRIGGER_RETRY_MS = T.triggerRetryMs; }
+  if (typeof T.triggerInitialDelayMs === "number") { TRIGGER_INITIAL_DELAY_MS = T.triggerInitialDelayMs; }
+  if (typeof T.autoOpenPanel === "boolean") { AUTO_OPEN_PICKUP_PANEL = T.autoOpenPanel; }
+
+  // ---------------------------------------------------------------- fragment
+  function parseCandidates(hash) {
+    var out = [];
+    var raw = String(hash || "");
+    if (raw.charAt(0) === "#") { raw = raw.slice(1); }
+    if (!raw) { return out; }
+    var value = null;
+    var pairs = raw.split("&");
+    for (var i = 0; i < pairs.length; i++) {
+      var eq = pairs[i].indexOf("=");
+      if (eq > 0 && pairs[i].slice(0, eq) === FRAGMENT_KEY) {
+        value = pairs[i].slice(eq + 1);
+        break;
+      }
+    }
+    if (value === null) { return out; }
+    var parts = decodeURIComponent(value).split(",");
+    for (var j = 0; j < parts.length && out.length < MAX_CANDIDATES; j++) {
+      var sn = parts[j].trim().toUpperCase();
+      if (STORE_RE.test(sn) && out.indexOf(sn) === -1) { out.push(sn); }
+    }
+    return out;
+  }
+
+  // 立即抹掉自定义 fragment，保留 fragment 里可能存在的其它内容；不刷新页面
+  function stripFragment() {
+    var raw = String(location.hash || "");
+    if (raw.charAt(0) === "#") { raw = raw.slice(1); }
+    var kept = [];
+    var pairs = raw.split("&");
+    for (var i = 0; i < pairs.length; i++) {
+      if (!pairs[i]) { continue; }
+      var eq = pairs[i].indexOf("=");
+      var key = eq > 0 ? pairs[i].slice(0, eq) : pairs[i];
+      if (key !== FRAGMENT_KEY) { kept.push(pairs[i]); }
+    }
+    var url = location.pathname + location.search + (kept.length ? "#" + kept.join("&") : "");
+    try {
+      history.replaceState(history.state, "", url);
+    } catch (e) {
+      /* 极端情况下拿不到 history：不影响后面的门店选择，也不做别的补救 */
+    }
+  }
+
+  // ---------------------------------------------------------------- 通用判定
+  function ownText(el) {
+    return String((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  }
+
+  function visible(el) {
+    if (!el) { return false; }
+    var box = el.getBoundingClientRect();
+    return box.width > 0 || box.height > 0;
+  }
+
+  // 红线校验：任何要点的元素都必须先过这一关
+  function isForbidden(el) {
+    if (!el) { return true; }
+    var autom = String(el.getAttribute && el.getAttribute("data-autom") || "");
+    for (var i = 0; i < FORBIDDEN_AUTOM.length; i++) {
+      if (autom.toLowerCase().indexOf(FORBIDDEN_AUTOM[i].toLowerCase()) >= 0) { return true; }
+    }
+    var text = ownText(el);
+    if (text.length <= TRIGGER_TEXT_MAX) {
+      for (var j = 0; j < FORBIDDEN_TEXT.length; j++) {
+        if (text.toLowerCase().indexOf(FORBIDDEN_TEXT[j].toLowerCase()) >= 0) { return true; }
+      }
+    }
+    return false;
+  }
+
+  // 祖先里带结账类 data-autom 的元素也不点。只对触发器做这层检查：
+  // 门店 radio 由 isStoreRadio 精确锁定，再查祖先只会带来误伤（查不中就整个功能失效）。
+  function insideForbiddenAncestor(el) {
+    if (!el || !el.closest) { return false; }
+    for (var k = 0; k < FORBIDDEN_AUTOM.length; k++) {
+      if (el.closest('[data-autom="' + FORBIDDEN_AUTOM[k] + '"]')) { return true; }
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------- 门店 radio
+  function isStoreRadio(el) {
+    return !!el && el.tagName === "INPUT" && el.type === "radio" &&
+      typeof el.name === "string" && el.name.indexOf("store-") === 0;
+  }
+
+  function labelFor(el) {
+    if (el.id) {
+      try {
+        var l = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]');
+        if (l) { return l; }
+      } catch (e) { /* 选择器异常时退回 closest */ }
+    }
+    return el.closest ? el.closest("label") : null;
+  }
+
+  function selectable(el) {
+    if (!isStoreRadio(el)) { return false; }
+    if (el.disabled) { return false; }
+    if (el.getAttribute("aria-disabled") === "true") { return false; }
+    if (el.closest && el.closest('[aria-disabled="true"]')) { return false; }
+    // Apple 常把真正的 input 视觉隐藏、由 label 显示，所以 input 或它的 label 可见即算可见
+    var l = labelFor(el);
+    if (!visible(el) && !visible(l)) { return false; }
+    return true;
+  }
+
+  function findRadio(store) {
+    var nodes = document.querySelectorAll(RADIO_SELECTOR);
+    for (var i = 0; i < nodes.length; i++) {
+      if (String(nodes[i].value || "").trim().toUpperCase() === store) { return nodes[i]; }
+    }
+    return null;
+  }
+
+  function panelPresent() {
+    return document.querySelector(RADIO_SELECTOR) !== null;
+  }
+
+  function storeNameOf(el) {
+    var container = labelFor(el) || el.parentElement;
+    if (!container) { return ""; }
+    var text = ownText(container);
+    return text.length > 24 ? text.slice(0, 24) + "…" : text;
+  }
+
+  // ---------------------------------------------------------------- 供货情况触发器
+  /*
+   * 只认“安全可点”的触发器：
+   *   - <button> 必须显式 type="button"。没写 type 的 button 在表单里默认是 submit，
+   *     点下去可能直接提交配置器表单（等于加入购物袋），所以一律拒绝。
+   *   - <a> 只允许没有 href、href="#" 或 href 以 "#" 开头的锚点，避免跳走。
+   *   - 其它元素必须带 role="button"。
+   */
+  function isPickupTrigger(el) {
+    if (!el || !el.tagName) { return false; }
+    if (isForbidden(el) || insideForbiddenAncestor(el)) { return false; }
+    if (el.disabled) { return false; }
+    if (el.getAttribute("aria-disabled") === "true") { return false; }
+    if (!visible(el)) { return false; }
+
+    var tag = el.tagName;
+    if (tag === "BUTTON") {
+      if (el.type !== "button") { return false; }
+    } else if (tag === "A") {
+      var href = String(el.getAttribute("href") || "");
+      if (href && href.charAt(0) !== "#") { return false; }
+    } else if (el.getAttribute("role") !== "button") {
+      return false;
+    }
+
+    // 身份确认：要么命中已知选择器，要么按钮文字就是“查看供货情况”这一类
+    for (var i = 0; i < TRIGGER_SELECTORS.length; i++) {
+      try {
+        if (el.matches && el.matches(TRIGGER_SELECTORS[i])) { return true; }
+      } catch (e) { /* 选择器不被支持时忽略 */ }
+    }
+    var text = ownText(el);
+    if (text.length > TRIGGER_TEXT_MAX) { return false; }
+    for (var j = 0; j < TRIGGER_TEXT.length; j++) {
+      if (text.indexOf(TRIGGER_TEXT[j]) >= 0) { return true; }
+    }
+    return false;
+  }
+
+  function findPickupTrigger() {
+    var i, nodes;
+    for (i = 0; i < TRIGGER_SELECTORS.length; i++) {
+      try {
+        nodes = document.querySelectorAll(TRIGGER_SELECTORS[i]);
+      } catch (e) { continue; }
+      for (var j = 0; j < nodes.length; j++) {
+        if (isPickupTrigger(nodes[j])) { return nodes[j]; }
+      }
+    }
+    nodes = document.querySelectorAll('button, a, [role="button"]');
+    var limit = Math.min(nodes.length, 400);
+    for (i = 0; i < limit; i++) {
+      if (isPickupTrigger(nodes[i])) { return nodes[i]; }
+    }
+    return null;
+  }
+
+  function overlayOpen(trigger) {
+    if (document.querySelector('[role="dialog"], [aria-modal="true"]')) { return true; }
+    if (trigger && trigger.getAttribute("aria-expanded") === "true") { return true; }
+    return false;
+  }
+
+  // ---------------------------------------------------------------- 唯一的点击出口
+  function safeClick(el, kind) {
+    if (kind === "store-radio") {
+      if (!isStoreRadio(el)) { return false; }
+    } else if (kind === "pickup-trigger") {
+      if (!isPickupTrigger(el)) { return false; }
+    } else {
+      return false;
+    }
+    if (isForbidden(el)) { return false; }
+    try {
+      if (el.focus) { el.focus({ preventScroll: true }); }
+      el.click();
+    } catch (e) {
+      return false;
+    }
+    return true;
+  }
+
+  // 普通 DOM 点击；必要时再补 input/change 事件
+  function selectRadio(el) {
+    if (!safeClick(el, "store-radio")) { return false; }
+    if (!el.checked) {
+      try {
+        el.checked = true;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (e) { return false; }
+    }
+    return el.checked === true;
+  }
+
+  // ---------------------------------------------------------------- 角标
+  function badge(ok, text) {
+    var host = document.createElement("div");
+    host.style.cssText = "all:initial;position:fixed;z-index:2147483647;right:16px;bottom:16px;";
+    var root = host.attachShadow ? host.attachShadow({ mode: "closed" }) : null;
+    var box = document.createElement("div");
+    box.setAttribute("role", "status");
+    box.textContent = text;
+    var style = document.createElement("style");
+    style.textContent =
+      ":host{all:initial}" +
+      "div{font:500 12px/1.45 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;" +
+      "max-width:300px;padding:8px 12px;border-radius:8px;color:#fff;" +
+      "box-shadow:0 2px 10px rgba(0,0,0,.28);" +
+      "background:" + (ok ? "#1d7a46" : "#8a5a00") + ";}";
+    if (root) {
+      root.appendChild(style);
+      root.appendChild(box);
+    } else {
+      host.appendChild(box);
+    }
+    host.addEventListener("click", function () {
+      if (host.parentNode) { host.parentNode.removeChild(host); }
+    });
+    (document.documentElement || document.body).appendChild(host);
+  }
+
+  // ---------------------------------------------------------------- 主流程
+  var candidates = parseCandidates(location.hash);
+  if (candidates.length) { stripFragment(); }
+
+  if (!candidates.length) {
+    // Mac 端没开门店助手，或这不是我们打开的页面：什么都不做，不点任何东西、不插角标、不起定时器
+    if (T.onDone) { T.onDone({ status: "inactive" }); }
+    return;
+  }
+
+  var started = Date.now();
+  var panelSeenAt = 0;
+  var finished = false;
+  var timer = null;
+  var observer = null;
+  var trigger = null;
+  var triggerClicks = 0;
+  var lastTriggerClickAt = 0;
+
+  function stop() {
+    finished = true;
+    if (timer) { clearInterval(timer); timer = null; }
+    if (observer) { observer.disconnect(); observer = null; }
+  }
+
+  function succeed(store, el) {
+    stop();
+    var name = storeNameOf(el);
+    badge(true, "已选中：" + (name ? name + " " : "") + store + "，请人工继续");
+    if (T.onDone) {
+      T.onDone({ status: "selected", store: store, name: name,
+        candidates: candidates, triggerClicks: triggerClicks });
+    }
+  }
+
+  function fail(reason) {
+    stop();
+    var text = "候选门店当前均无法自动选择，请手动操作";
+    if (reason === "panel_timeout") { text += "（门店列表未出现）"; }
+    badge(false, text);
+    if (T.onDone) {
+      T.onDone({ status: "failed", reason: reason,
+        candidates: candidates, triggerClicks: triggerClicks });
+    }
+  }
+
+  // 门店列表还没出来时，尝试点一次“查看供货情况”。弹窗已开或次数用完就不再点。
+  function tryOpenPickupPanel(now) {
+    if (!AUTO_OPEN_PICKUP_PANEL) { return; }
+    if (now - started < TRIGGER_INITIAL_DELAY_MS) { return; }
+    if (triggerClicks >= MAX_TRIGGER_CLICKS) { return; }
+    if (now - lastTriggerClickAt < TRIGGER_RETRY_MS) { return; }
+    if (overlayOpen(trigger)) { return; }
+    var el = findPickupTrigger();
+    if (!el) { return; }
+    trigger = el;
+    if (safeClick(el, "pickup-trigger")) {
+      triggerClicks += 1;
+      lastTriggerClickAt = now;
+    } else {
+      // 找到了但不安全（例如 type=submit）：记为已用完，绝不降级去点别的东西
+      triggerClicks = MAX_TRIGGER_CLICKS;
+    }
+  }
+
+  function tick() {
+    if (finished) { return; }
+    var now = Date.now();
+    var present = panelPresent();
+    if (present && !panelSeenAt) { panelSeenAt = Date.now(); }
+    if (!present) { tryOpenPickupPanel(now); }
+
+    // 按候选顺序逐个试：最高优先的不存在或不可选，立刻看下一个
+    for (var i = 0; i < candidates.length; i++) {
+      var el = findRadio(candidates[i]);
+      if (!el || !selectable(el)) { continue; }
+      if (el.checked === true) { succeed(candidates[i], el); return; }
+      if (selectRadio(el)) { succeed(candidates[i], el); return; }
+      // 点了没生效：不纠缠，直接看下一个候选
+    }
+
+    if (panelSeenAt && now - panelSeenAt >= PANEL_SETTLE_MS) { fail("no_selectable_candidate"); return; }
+    if (now - started >= PANEL_TIMEOUT_MS) { fail(panelSeenAt ? "no_selectable_candidate" : "panel_timeout"); }
+  }
+
+  timer = setInterval(tick, POLL_MS);
+  try {
+    observer = new MutationObserver(tick);
+    observer.observe(document.documentElement || document, {
+      childList: true, subtree: true,
+      attributes: true, attributeFilter: ["disabled", "aria-disabled", "value", "checked", "aria-expanded"]
+    });
+  } catch (e) {
+    observer = null; // 只靠轮询也能工作
+  }
+  tick();
+})();
